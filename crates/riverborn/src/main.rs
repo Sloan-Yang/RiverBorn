@@ -1,12 +1,43 @@
-//! RiverBorn —— Bevy 表现层（单机对 AI 起步骨架）。
+//! RiverBorn —— Bevy 表现层。
 //!
-//! 牌桌布局：6 个座位环绕四周，中间公共池，下方 Boss/地牢池，每座位面前两张
-//! 底牌位。素材来自 assets/：背景、卡背每局随机；公共牌/地牢牌/底牌按各自的
-//! 美术 id 贴图，未翻开的牌显示卡背。规则全在 game_core，这一层只做「显示 + 输入」。
+//! 顶层是状态机 [`AppState`]：主菜单 → 单人 / 多人 / 设置。
+//! - 主菜单：标题 + 三个按钮，循环 Main_menu_music。
+//! - 单人：现有牌桌玩法，循环 Iron_Stakes，翻牌播 shuffle_card。
+//! - 多人 / 设置：占位页，Esc 返回菜单。
+//!
+//! 牌桌布局（常量 + setup 里各 spawn 的坐标尺寸）是手动调好的，本层只在
+//! 进入单人时按原坐标摆放、离开时整体清理；规则全在 game_core。
 
 use bevy::audio::{AudioPlayer, AudioSource, PlaybackSettings};
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
+use bevy::winit::WinitWindows;
 use game_core::{Action, Adventurer, Class, Game, Phase, Player};
+use winit::window::Icon;
+
+// ============================ 状态 ============================
+
+#[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
+enum AppState {
+    #[default]
+    MainMenu,
+    SinglePlayer,
+    Multiplayer,
+    Settings,
+}
+
+/// 单人游戏内的暂停子状态（只在 SinglePlayer 下存在）。
+/// Running 时游戏逻辑正常跑；Paused/Settings 时逻辑停（即暂停），叠加菜单 overlay。
+#[derive(SubStates, Default, Debug, Clone, PartialEq, Eq, Hash)]
+#[source(AppState = AppState::SinglePlayer)]
+enum PauseState {
+    #[default]
+    Running,
+    Paused,
+    Settings,
+}
+
+// ============================ 资源 ============================
 
 /// 把整局游戏作为一个 Bevy 资源持有。
 #[derive(Resource)]
@@ -14,18 +45,22 @@ struct GameSession {
     game: Game,
 }
 
-/// 音频资源：背景音乐循环播放，动作音效在合法行动后触发。
+/// 全局音频句柄。BGM 按状态切换，动作音效在合法行动后触发。
 #[derive(Resource, Clone)]
 struct AudioAssets {
-    bgm: Handle<AudioSource>,
-    check: Handle<AudioSource>,
-    fold: Handle<AudioSource>,
-    raise: Handle<AudioSource>,
+    game_bgm: Handle<AudioSource>, // 单人局：Iron_Stakes.mp3
+    shuffle: Handle<AudioSource>,  // 发牌音效：shuffle_card.mp3
 }
 
 /// 本局选中的卡背（盖住的牌都用它）。
 #[derive(Resource)]
 struct CardBack(Handle<Image>);
+
+/// 已翻开的牌总数，用来检测「又翻牌了」以触发发牌音效。
+#[derive(Resource)]
+struct RevealCount(usize);
+
+// ============================ 标记 ============================
 
 /// 每个会被刷新的位置，用这个枚举标明它代表牌桌上的哪个槽。
 #[derive(Component)]
@@ -37,12 +72,35 @@ enum Slot {
     Hole { seat: usize, idx: usize }, // 第 i 个座位的第 idx 张底牌（图片）
 }
 
+/// 主菜单按钮。
+#[derive(Component)]
+enum MenuButton {
+    SinglePlayer,
+    Multiplayer,
+    Settings,
+    Exit,
+}
+
+/// 暂停菜单按钮。
+#[derive(Component)]
+enum PauseButton {
+    Resume,
+    Settings,
+    MainMenu,
+}
+
+/// 暂停层 overlay 的根标记，便于单独清理（不波及牌桌）。
+#[derive(Component)]
+struct PauseUi;
+
 // 边框配色
 const COL_DIM: Color = Color::srgb(0.30, 0.32, 0.38);    // 未翻开/空位
 const COL_GOLD: Color = Color::srgb(0.85, 0.72, 0.35);   // 公共池
 const COL_RED: Color = Color::srgb(0.85, 0.35, 0.35);    // 地牢/Boss
 const COL_HOLE: Color = Color::srgb(0.55, 0.58, 0.65);   // 底牌
 const COL_ACTIVE: Color = Color::srgb(0.40, 0.85, 0.45); // 当前行动高亮
+const BTN_NORMAL: Color = Color::srgb(0.16, 0.18, 0.26); // 菜单按钮常态
+const BTN_HOVER: Color = Color::srgb(0.28, 0.32, 0.44);  // 菜单按钮悬停
 
 /// 牌桌尺寸（窗口逻辑像素）。
 const W: f32 = 2048.0;
@@ -96,11 +154,154 @@ fn main() {
             ..default()
         }))
         .insert_resource(ClearColor(Color::srgb(0.08, 0.09, 0.12)))
-        .insert_resource(new_session())
-        .add_systems(Startup, setup_table)
-        .add_systems(Update, (ai_auto_play, handle_input, refresh).chain())
+        .init_state::<AppState>()
+        .add_sub_state::<PauseState>()
+        .add_systems(Startup, (setup, set_window_icon))
+        // 主菜单
+        .add_systems(OnEnter(AppState::MainMenu), enter_main_menu)
+        .add_systems(Update, menu_buttons.run_if(in_state(AppState::MainMenu)))
+        // 单人：游戏逻辑只在「未暂停」时跑
+        .add_systems(OnEnter(AppState::SinglePlayer), enter_single_player)
+        .add_systems(
+            Update,
+            (ai_auto_play, handle_input, deal_sfx)
+                .chain()
+                .run_if(in_state(PauseState::Running)),
+        )
+        // 画面刷新单人全程都跑（暂停时也要显示牌桌）
+        .add_systems(Update, refresh.run_if(in_state(AppState::SinglePlayer)))
+        // 单人内的暂停切换 + 暂停菜单
+        .add_systems(Update, pause_input.run_if(in_state(AppState::SinglePlayer)))
+        .add_systems(Update, pause_buttons.run_if(in_state(PauseState::Paused)))
+        .add_systems(OnEnter(PauseState::Paused), enter_pause_menu)
+        .add_systems(OnEnter(PauseState::Settings), enter_pause_settings)
+        .add_systems(OnExit(PauseState::Paused), cleanup_pause)
+        .add_systems(OnExit(PauseState::Settings), cleanup_pause)
+        // 多人 / 设置（占位）
+        .add_systems(OnEnter(AppState::Multiplayer), enter_multiplayer)
+        .add_systems(OnEnter(AppState::Settings), enter_settings)
+        // 多人/设置顶层页面按 Esc 返回主菜单（单人的 Esc 交给 pause_input）
+        .add_systems(
+            Update,
+            back_to_menu.run_if(|s: Res<State<AppState>>| {
+                matches!(*s.get(), AppState::Multiplayer | AppState::Settings)
+            }),
+        )
+        // 每个状态退出时清理它生成的 UI 与音频
+        .add_systems(OnExit(AppState::MainMenu), cleanup)
+        .add_systems(OnExit(AppState::SinglePlayer), cleanup)
+        .add_systems(OnExit(AppState::Multiplayer), cleanup)
+        .add_systems(OnExit(AppState::Settings), cleanup)
         .run();
 }
+
+/// Startup：全局相机 + 预加载所有音频句柄。
+fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+    commands.spawn(Camera2d);
+    commands.insert_resource(AudioAssets {
+        game_bgm: assets.load("audio/Iron_Stakes.mp3"),
+        shuffle: assets.load("audio/shuffle_card.mp3"),
+    });
+}
+
+// ============================ 主菜单 ============================
+
+fn enter_main_menu(mut commands: Commands, assets: Res<AssetServer>) {
+    // 菜单背景，铺满整窗、钉在最底层。
+    commands.spawn((
+        ImageNode::new(assets.load("main_menu.png")),
+        Node {
+            position_type: PositionType::Absolute,
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            ..default()
+        },
+        GlobalZIndex(-1),
+    ));
+
+    // 菜单 BGM（循环）。离开菜单时由 cleanup 停掉。
+    // 注意：初始状态的 OnEnter 比 Startup 还早，这里不能依赖预载的 AudioAssets，
+    // 直接用 AssetServer 加载。
+    commands.spawn((
+        AudioPlayer::new(assets.load("audio/Main_menu_music.mp3")),
+        PlaybackSettings::LOOP,
+    ));
+
+    commands
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            row_gap: Val::Px(24.0),
+            ..default()
+        })
+        .with_children(|root| {
+            // 游戏名称图（1301×515，按比例缩到 650×257）。
+            root.spawn((
+                ImageNode::new(assets.load("game_name.png")),
+                Node {
+                    width: Val::Px(650.0),
+                    height: Val::Px(257.0),
+                    margin: UiRect::bottom(Val::Px(32.0)),
+                    ..default()
+                },
+            ));
+            menu_button(root, MenuButton::SinglePlayer, "Single Player");
+            menu_button(root, MenuButton::Multiplayer, "Multiplayer");
+            menu_button(root, MenuButton::Settings, "Settings");
+            menu_button(root, MenuButton::Exit, "Exit");
+        });
+}
+
+fn menu_button(parent: &mut ChildBuilder, action: MenuButton, label: &str) {
+    parent
+        .spawn((
+            Button,
+            Node {
+                width: Val::Px(360.0),
+                height: Val::Px(72.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor(Color::srgb(0.45, 0.48, 0.58)),
+            BackgroundColor(BTN_NORMAL),
+            action,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(label),
+                TextFont { font_size: 30.0, ..default() },
+                TextColor(Color::srgb(0.92, 0.94, 0.97)),
+            ));
+        });
+}
+
+fn menu_buttons(
+    mut next: ResMut<NextState<AppState>>,
+    mut exit: EventWriter<AppExit>,
+    mut q: Query<(&Interaction, &MenuButton, &mut BackgroundColor), Changed<Interaction>>,
+) {
+    for (interaction, action, mut bg) in &mut q {
+        match interaction {
+            Interaction::Pressed => match action {
+                MenuButton::SinglePlayer => next.set(AppState::SinglePlayer),
+                MenuButton::Multiplayer => next.set(AppState::Multiplayer),
+                MenuButton::Settings => next.set(AppState::Settings),
+                MenuButton::Exit => {
+                    exit.send(AppExit::Success);
+                }
+            },
+            Interaction::Hovered => bg.0 = BTN_HOVER,
+            Interaction::None => bg.0 = BTN_NORMAL,
+        }
+    }
+}
+
+// ============================ 单人游戏 ============================
 
 fn new_session() -> GameSession {
     use Class::*;
@@ -127,8 +328,12 @@ const SEATS: [(f32, f32); 6] = [
     (1700.0, 700.0), // 5 右-下（第 6 人）
 ];
 
-fn setup_table(mut commands: Commands, assets: Res<AssetServer>, session: Res<GameSession>) {
-    commands.spawn(Camera2d);
+fn enter_single_player(mut commands: Commands, assets: Res<AssetServer>, audio: Res<AudioAssets>) {
+    let session = new_session();
+
+    // 游戏内 BGM（循环）+ 入局发牌音效（一次性，播完自动 despawn）。
+    commands.spawn((AudioPlayer::new(audio.game_bgm.clone()), PlaybackSettings::LOOP));
+    commands.spawn((AudioPlayer::new(audio.shuffle.clone()), PlaybackSettings::DESPAWN));
 
     // 1) 牌桌背景，铺满整窗。GlobalZIndex(-1) 明确钉在最底层
     //    （仅靠 spawn 顺序在 Bevy UI 里不保证压在底下）。
@@ -148,20 +353,7 @@ fn setup_table(mut commands: Commands, assets: Res<AssetServer>, session: Res<Ga
     let card_back: Handle<Image> = assets.load(format!("cards/{}.png", pick(&CARD_BACKS)));
     commands.insert_resource(CardBack(card_back.clone()));
 
-    // 3) 加载音频资源，并开始循环播放背景音乐。
-    let audio_assets = AudioAssets {
-        bgm: assets.load("audio/bgm.ogg"),
-        check: assets.load("audio/check.ogg"),
-        fold: assets.load("audio/fold.ogg"),
-        raise: assets.load("audio/raise.ogg"),
-    };
-    commands.spawn((
-        AudioPlayer::new(audio_assets.bgm.clone()),
-        PlaybackSettings::LOOP,
-    ));
-    commands.insert_resource(audio_assets);
-
-    // 4) 左上角状态栏（无边框纯文字）。
+    // 3) 左上角状态栏（无边框纯文字）。
     commands.spawn((
         Text::new(""),
         TextFont { font_size: 22.0, ..default() },
@@ -176,7 +368,7 @@ fn setup_table(mut commands: Commands, assets: Res<AssetServer>, session: Res<Ga
         Slot::Status,
     ));
 
-    // 5) 公共池：5 张横排（初始卡背）。
+    // 4) 公共池：5 张横排（初始卡背）。
     for i in 0..5 {
         spawn_card(
             &mut commands,
@@ -196,7 +388,7 @@ fn setup_table(mut commands: Commands, assets: Res<AssetServer>, session: Res<Ga
         "Community Pool",
     );
 
-    // 6) 地牢/Boss 池：3 个节点（初始卡背）。
+    // 5) 地牢/Boss 池：3 个节点（初始卡背）。
     for i in 0..3 {
         spawn_card(
             &mut commands,
@@ -216,7 +408,7 @@ fn setup_table(mut commands: Commands, assets: Res<AssetServer>, session: Res<Ga
         "Dungeon / Boss",
     );
 
-    // 7) 座位：头像 + 名字 + 两张底牌位。
+    // 6) 座位：头像 + 名字 + 两张底牌位。
     for (seat, (x, y)) in SEATS.iter().enumerate() {
         if let Some(p) = session.game.players.get(seat) {
             spawn_avatar(&mut commands, *x, *y, assets.load(avatar_path(p)));
@@ -243,6 +435,9 @@ fn setup_table(mut commands: Commands, assets: Res<AssetServer>, session: Res<Ga
             Slot::Hole { seat, idx: 1 },
         );
     }
+
+    commands.insert_resource(RevealCount(0));
+    commands.insert_resource(session);
 }
 
 /// 一张牌位：带边框的图片（内容由 refresh 切换成卡背或牌面）。
@@ -327,21 +522,35 @@ fn avatar_path(p: &Player) -> String {
     }
 }
 
-/// 用进程启动时刻做种子，从列表里挑一个（每次运行 = 每局，结果不同）。
+/// 从列表里随机挑一个（每次运行 = 每局，结果不同）。
+///
+/// 注意：不能直接用 `纳秒 % len`——Windows 系统时间精度是 100ns，纳秒恒为 100 的
+/// 倍数，`% 6` 只会落在 {0,2,4}，导致一半场景永远抽不中。这里先用 splitmix64
+/// 把时间种子打散，再取模。混入数组地址，让相邻的两次调用（背景/卡背）互相独立。
 fn pick(list: &[&'static str]) -> &'static str {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0) as usize;
-    list[nanos % list.len()]
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0) as u64;
+    let seed = nanos ^ (list.as_ptr() as u64);
+    let r = game_core::rng::Rng::new(seed).next_u64() as usize;
+    list[r % list.len()]
+}
+
+/// 翻牌时（已揭示牌数增加）播放一次发牌音效。
+fn deal_sfx(
+    mut commands: Commands,
+    audio: Res<AudioAssets>,
+    session: Res<GameSession>,
+    mut reveal: ResMut<RevealCount>,
+) {
+    let revealed = session.game.community.len() + session.game.dungeon.len();
+    if revealed > reveal.0 {
+        commands.spawn((AudioPlayer::new(audio.shuffle.clone()), PlaybackSettings::DESPAWN));
+    }
+    reveal.0 = revealed;
 }
 
 /// AI 玩家自动行动，用计时器拉开节奏，方便人类玩家旁观。
-fn ai_auto_play(
-    time: Res<Time>,
-    mut delay: Local<f32>,
-    mut session: ResMut<GameSession>,
-    mut commands: Commands,
-    audio: Res<AudioAssets>,
-) {
+fn ai_auto_play(time: Res<Time>, mut delay: Local<f32>, mut session: ResMut<GameSession>) {
     let g = &mut session.game;
     if g.phase == Phase::Showdown || g.phase == Phase::Done {
         return;
@@ -357,18 +566,11 @@ fn ai_auto_play(
     }
     *delay = 0.0;
     let action = game_core::ai::decide(g, idx);
-    if g.apply(action).is_ok() {
-        play_action_sound(&mut commands, &audio, action);
-    }
+    let _ = g.apply(action);
 }
 
 /// 键盘输入：Q=Check, W=Call, E=Raise+20, R=Fold。仅在轮到人类时生效。
-fn handle_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut session: ResMut<GameSession>,
-    mut commands: Commands,
-    audio: Res<AudioAssets>,
-) {
+fn handle_input(keys: Res<ButtonInput<KeyCode>>, mut session: ResMut<GameSession>) {
     let g = &mut session.game;
     if g.phase == Phase::Showdown || g.phase == Phase::Done {
         return;
@@ -388,19 +590,8 @@ fn handle_input(
         None
     };
     if let Some(a) = action {
-        if g.apply(a).is_ok() {
-            play_action_sound(&mut commands, &audio, a);
-        }
+        let _ = g.apply(a);
     }
-}
-
-fn play_action_sound(commands: &mut Commands, audio: &AudioAssets, action: Action) {
-    let sound = match action {
-        Action::Check | Action::Call => audio.check.clone(),
-        Action::Fold => audio.fold.clone(),
-        Action::Raise { .. } | Action::AllIn => audio.raise.clone(),
-    };
-    commands.spawn(AudioPlayer::new(sound));
 }
 
 /// 统一刷新所有槽位（文字槽改字、图片槽换图/换边框色）。
@@ -494,7 +685,237 @@ fn status_text(g: &Game) -> String {
         }
     } else {
         let actor = g.players.get(g.to_act).map(|p| p.name.as_str()).unwrap_or("-");
-        s.push_str(&format!("To act: {actor}\n[Q]Check [W]Call\n[E]Raise [R]Fold"));
+        s.push_str(&format!("To act: {actor}\n[Q]Check [W]Call\n[E]Raise [R]Fold\n[Esc] Menu"));
     }
     s
+}
+
+// ============================ 多人 / 设置（占位）============================
+
+fn enter_multiplayer(mut commands: Commands) {
+    let plan = "\
+联机部分尚未实现，先放规划：
+
+· 架构：服务器权威。发牌/下注/战斗结算都在服务器用 game_core 跑，\n  客户端只发动作、收状态。
+· 隐藏信息：底牌只下发给本人，摊牌前对手底牌不出现在该客户端。
+· 同步：bevy_replicon 或 lightyear 做状态复制；game_core 的确定性\n  + 固定 seed 便于对齐。
+· 大厅：创建/加入房间，2–6 人入座后开局。
+
+（game_core 已与引擎解耦，这些都能直接复用现有规则逻辑。）";
+    spawn_info_screen(&mut commands, "Multiplayer — Coming Soon", plan);
+}
+
+fn enter_settings(mut commands: Commands) {
+    spawn_info_screen(&mut commands, "Settings", "设置项待定（音量、分辨率、按键等）。");
+}
+
+/// 居中的信息页：大标题 + 正文 + 返回提示。
+fn spawn_info_screen(commands: &mut Commands, title: &str, body: &str) {
+    commands
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            row_gap: Val::Px(20.0),
+            ..default()
+        })
+        .with_children(|root| {
+            root.spawn((
+                Text::new(title),
+                TextFont { font_size: 48.0, ..default() },
+                TextColor(Color::srgb(0.95, 0.85, 0.55)),
+            ));
+            root.spawn((
+                Text::new(body),
+                TextFont { font_size: 22.0, ..default() },
+                TextColor(Color::srgb(0.82, 0.84, 0.88)),
+                Node { max_width: Val::Px(1000.0), ..default() },
+            ));
+            root.spawn((
+                Text::new("Press [Esc] to go back"),
+                TextFont { font_size: 20.0, ..default() },
+                TextColor(Color::srgb(0.55, 0.58, 0.65)),
+            ));
+        });
+}
+
+/// 任意非主菜单状态下，按 Esc 回主菜单。
+fn back_to_menu(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<AppState>>) {
+    if keys.just_pressed(KeyCode::Escape) {
+        next.set(AppState::MainMenu);
+    }
+}
+
+/// 离开任一状态时，清掉它生成的所有 UI（根节点递归）与音频实体。
+/// 只删根节点，children 由 despawn_recursive 一并带走，避免重复删除告警。
+/// 全局相机不是 UI 节点、不是音频，不受影响。
+fn cleanup(
+    mut commands: Commands,
+    roots: Query<Entity, (With<Node>, Without<Parent>)>,
+    audio: Query<Entity, With<AudioPlayer>>,
+) {
+    for e in &roots {
+        commands.entity(e).despawn_recursive();
+    }
+    for e in &audio {
+        commands.entity(e).despawn_recursive();
+    }
+}
+
+// ============================ 暂停菜单（单人内）============================
+
+/// 单人游戏中按 Esc 在 运行 / 暂停 / 设置 之间切换。
+fn pause_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    cur: Res<State<PauseState>>,
+    mut next: ResMut<NextState<PauseState>>,
+) {
+    if !keys.just_pressed(KeyCode::Escape) {
+        return;
+    }
+    next.set(match cur.get() {
+        PauseState::Running => PauseState::Paused,  // 暂停
+        PauseState::Paused => PauseState::Running,  // 继续
+        PauseState::Settings => PauseState::Paused, // 从设置回暂停菜单
+    });
+}
+
+/// 弹出暂停菜单 overlay：半透明遮罩 + 标题 + 三个按钮。
+fn enter_pause_menu(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(20.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.72)),
+            GlobalZIndex(100), // 盖在牌桌之上
+            PauseUi,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Text::new("Paused"),
+                TextFont { font_size: 60.0, ..default() },
+                TextColor(Color::srgb(0.95, 0.85, 0.55)),
+                Node { margin: UiRect::bottom(Val::Px(24.0)), ..default() },
+            ));
+            pause_button(root, PauseButton::Resume, "Resume");
+            pause_button(root, PauseButton::Settings, "Settings");
+            pause_button(root, PauseButton::MainMenu, "Main Menu");
+        });
+}
+
+/// 暂停内的设置 overlay（占位）。
+fn enter_pause_settings(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(20.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.85)),
+            GlobalZIndex(100),
+            PauseUi,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Text::new("Settings"),
+                TextFont { font_size: 48.0, ..default() },
+                TextColor(Color::srgb(0.95, 0.85, 0.55)),
+            ));
+            root.spawn((
+                Text::new("设置项待定（音量、分辨率、按键等）。"),
+                TextFont { font_size: 22.0, ..default() },
+                TextColor(Color::srgb(0.82, 0.84, 0.88)),
+            ));
+            root.spawn((
+                Text::new("Press [Esc] to go back"),
+                TextFont { font_size: 20.0, ..default() },
+                TextColor(Color::srgb(0.55, 0.58, 0.65)),
+            ));
+        });
+}
+
+fn pause_button(parent: &mut ChildBuilder, action: PauseButton, label: &str) {
+    parent
+        .spawn((
+            Button,
+            Node {
+                width: Val::Px(320.0),
+                height: Val::Px(64.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor(Color::srgb(0.45, 0.48, 0.58)),
+            BackgroundColor(BTN_NORMAL),
+            action,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(label),
+                TextFont { font_size: 26.0, ..default() },
+                TextColor(Color::srgb(0.92, 0.94, 0.97)),
+            ));
+        });
+}
+
+/// 处理暂停菜单按钮。
+fn pause_buttons(
+    mut next_pause: ResMut<NextState<PauseState>>,
+    mut next_app: ResMut<NextState<AppState>>,
+    mut q: Query<(&Interaction, &PauseButton, &mut BackgroundColor), Changed<Interaction>>,
+) {
+    for (interaction, action, mut bg) in &mut q {
+        match interaction {
+            Interaction::Pressed => match action {
+                PauseButton::Resume => next_pause.set(PauseState::Running),
+                PauseButton::Settings => next_pause.set(PauseState::Settings),
+                PauseButton::MainMenu => next_app.set(AppState::MainMenu),
+            },
+            Interaction::Hovered => bg.0 = BTN_HOVER,
+            Interaction::None => bg.0 = BTN_NORMAL,
+        }
+    }
+}
+
+/// 清理暂停层 overlay（继续游戏 / 切到设置 / 离开单人时）。
+fn cleanup_pause(mut commands: Commands, q: Query<Entity, With<PauseUi>>) {
+    for e in &q {
+        commands.entity(e).despawn_recursive();
+    }
+}
+
+// ============================ 窗口图标 ============================
+
+/// 把 assets/game_icon.png 设为窗口图标。字节编译进二进制，不依赖运行目录。
+fn set_window_icon(windows: NonSend<WinitWindows>, primary: Query<Entity, With<PrimaryWindow>>) {
+    let Ok(entity) = primary.get_single() else {
+        return;
+    };
+    let Some(window) = windows.get_window(entity) else {
+        return;
+    };
+    let bytes = include_bytes!("../assets/game_icon.png");
+    let rgba = match image::load_from_memory(bytes) {
+        Ok(img) => img.into_rgba8(),
+        Err(_) => return,
+    };
+    let (w, h) = rgba.dimensions();
+    if let Ok(icon) = Icon::from_rgba(rgba.into_raw(), w, h) {
+        window.set_window_icon(Some(icon));
+    }
 }

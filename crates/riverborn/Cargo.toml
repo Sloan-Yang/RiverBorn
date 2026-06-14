@@ -12,3 +12,8 @@ bevy = { version = "0.15", features = ["mp3"] }
 # 强制 blake3 用纯 Rust 实现，绕过 MSYS2 gcc 编译 C/SIMD 失败的问题。
 # blake3 在 Bevy 里只做资源哈希，纯 Rust 版对本游戏无性能影响。
 blake3 = { version = "1", features = ["pure"] }
+
+# 设置窗口图标用：winit 提供 Icon/set_window_icon，image 解码 png。
+# 版本与 Bevy 0.15 内部使用的一致，cargo 会复用同一实例。
+winit = "0.30"
+image = "0.25"
