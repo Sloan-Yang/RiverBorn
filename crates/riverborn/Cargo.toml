@@ -1,0 +1,9 @@
+[package]
+name = "riverborn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+game_core = { path = "../game_core" }
+bevy = "0.15"

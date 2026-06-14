@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/game_core", "crates/riverborn"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# 表现层（Bevy）默认开优化，否则渲染会卡。逻辑库在 dev 下保持快速编译。
+[profile.dev.package."*"]
+opt-level = 3
