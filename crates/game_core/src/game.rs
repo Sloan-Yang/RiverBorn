@@ -54,7 +54,10 @@ pub struct Game {
     pub dungeon: Vec<Monster>,         // 已翻开的地牢节点（最多 3）
 
     community_deck: Vec<CommunityCard>,
-    dungeon_deck: Vec<Monster>,
+    // 地牢分三档，按阶段发：Flop 小怪、Turn 精英、River Boss。
+    small_deck: Vec<Monster>,
+    elite_deck: Vec<Monster>,
+    boss_deck: Vec<Monster>,
 }
 
 impl Game {
@@ -73,9 +76,11 @@ impl Game {
 
         let n = players.len();
         let mut community_deck = sample_community_deck();
-        let mut dungeon_deck = sample_dungeon_deck();
+        let (mut small_deck, mut elite_deck, mut boss_deck) = sample_dungeon_decks();
         rng.shuffle(&mut community_deck);
-        rng.shuffle(&mut dungeon_deck);
+        rng.shuffle(&mut small_deck);
+        rng.shuffle(&mut elite_deck);
+        rng.shuffle(&mut boss_deck);
 
         let mut game = Self {
             players,
@@ -87,7 +92,9 @@ impl Game {
             community: Vec::new(),
             dungeon: Vec::new(),
             community_deck,
-            dungeon_deck,
+            small_deck,
+            elite_deck,
+            boss_deck,
         };
         game.to_act = game.first_to_act();
         game
@@ -230,19 +237,25 @@ impl Game {
             Phase::PreFlop => {
                 self.phase = Phase::Flop;
                 self.deal_community(3);
-                self.deal_dungeon(1);
+                if let Some(m) = self.small_deck.pop() {
+                    self.dungeon.push(m); // 小怪
+                }
                 self.start_betting_round();
             }
             Phase::Flop => {
                 self.phase = Phase::Turn;
                 self.deal_community(1);
-                self.deal_dungeon(1);
+                if let Some(m) = self.elite_deck.pop() {
+                    self.dungeon.push(m); // 精英 / 环境
+                }
                 self.start_betting_round();
             }
             Phase::Turn => {
                 self.phase = Phase::River;
                 self.deal_community(1);
-                self.deal_dungeon(1); // Boss
+                if let Some(m) = self.boss_deck.pop() {
+                    self.dungeon.push(m); // Boss
+                }
                 self.start_betting_round();
             }
             Phase::River => self.goto_showdown(),
@@ -262,13 +275,6 @@ impl Game {
         }
     }
 
-    fn deal_dungeon(&mut self, n: usize) {
-        for _ in 0..n {
-            if let Some(m) = self.dungeon_deck.pop() {
-                self.dungeon.push(m);
-            }
-        }
-    }
 
     // ---- 摊牌 / 战斗结算 ----
 
@@ -340,7 +346,7 @@ fn community_team_buff(community: &[CommunityCard]) -> (u32, u32) {
                 power += a.power;
                 health += a.health;
             }
-            CommunityCard::Gear { bonus_power, bonus_health } => {
+            CommunityCard::Gear { bonus_power, bonus_health, .. } => {
                 power += bonus_power;
                 health += bonus_health;
             }
@@ -390,30 +396,58 @@ pub struct Settlement {
 
 // ---- 占位牌库（之后替换为真正的卡牌设计）----
 
+// art 名对应 assets/cards/community/<art>.png。
 fn sample_community_deck() -> Vec<CommunityCard> {
     use Class::*;
+    fn unit(class: Class, p: u32, h: u32, art: &'static str) -> CommunityCard {
+        CommunityCard::Unit(Adventurer::new(class, p, h, art))
+    }
+    fn gear(p: u32, h: u32, art: &'static str) -> CommunityCard {
+        CommunityCard::Gear { bonus_power: p, bonus_health: h, art }
+    }
     vec![
-        CommunityCard::Unit(Adventurer::new(Warrior, 3, 8)),
-        CommunityCard::Unit(Adventurer::new(Cleric, 2, 5)),
-        CommunityCard::Unit(Adventurer::new(Mage, 6, 3)),
-        CommunityCard::Unit(Adventurer::new(Rogue, 5, 4)),
-        CommunityCard::Unit(Adventurer::new(Ranger, 4, 5)),
-        CommunityCard::Gear { bonus_power: 3, bonus_health: 0 },
-        CommunityCard::Gear { bonus_power: 0, bonus_health: 6 },
-        CommunityCard::Unit(Adventurer::new(Warrior, 2, 10)),
-        CommunityCard::Unit(Adventurer::new(Mage, 7, 2)),
-        CommunityCard::Gear { bonus_power: 2, bonus_health: 4 },
+        // 角色
+        unit(Warrior, 3, 9, "Warrior"),
+        unit(Warrior, 4, 8, "Knight"),
+        unit(Cleric, 2, 6, "Cleric"),
+        unit(Mage, 7, 2, "Mage"),
+        unit(Rogue, 5, 4, "Rogue"),
+        unit(Ranger, 4, 5, "Archer"),
+        unit(Ranger, 5, 4, "Scout"),
+        // 装备
+        gear(0, 6, "Iron_Shield"),
+        gear(3, 0, "Dagger"),
+        gear(4, 0, "Arcane_Staff"),
+        gear(3, 1, "Longbow"),
+        // 技能 / 药剂
+        gear(5, 0, "Fireball"),
+        gear(0, 5, "Healing_Potion"),
+        gear(0, 4, "Holy_Chalice"),
+        gear(0, 3, "Purify"),
+        gear(2, 1, "Smoke_Bomb"),
     ]
 }
 
-fn sample_dungeon_deck() -> Vec<Monster> {
-    vec![
-        Monster::new(MonsterKind::Goblin, 5, 4),
-        Monster::new(MonsterKind::Elite, 9, 8),
-        Monster::new(MonsterKind::PoisonSwamp, 6, 12),
-        Monster::new(MonsterKind::Treasure, 0, 0),
-        Monster::new(MonsterKind::Boss, 14, 16),
-    ]
+// art 名对应 assets/cards/dungeon/<art>.png。三档分别在 Flop/Turn/River 翻开。
+fn sample_dungeon_decks() -> (Vec<Monster>, Vec<Monster>, Vec<Monster>) {
+    use MonsterKind::*;
+    let smalls = vec![
+        Monster::new(Goblin, 5, 4, "Goblin"),
+        Monster::new(Goblin, 6, 5, "Skeleton_Soldier"),
+        Monster::new(Goblin, 7, 4, "Dire_Wolf"),
+    ];
+    let elites = vec![
+        Monster::new(Elite, 9, 8, "Elite_Goblin-Chief"),
+        Monster::new(Elite, 8, 9, "Elite_Mimic"),
+        Monster::new(PoisonSwamp, 9, 12, "Elite_Swamp_Witch"),
+    ];
+    let bosses = vec![
+        Monster::new(Boss, 15, 18, "Boss_Ancient_Dragon"),
+        Monster::new(Boss, 14, 16, "Boss_Troll_King"),
+        Monster::new(Boss, 13, 17, "Boss_lich"),
+        Monster::new(Boss, 14, 17, "Boss_Corrupted_Tree_Lord"),
+    ];
+    (smalls, elites, bosses)
 }
 
 #[cfg(test)]
@@ -429,7 +463,7 @@ mod tests {
                     format!("P{i}"),
                     i != 0, // P0 是人类，其余 AI
                     chips,
-                    [Adventurer::new(Warrior, 4, 9), Adventurer::new(Mage, 6, 3)],
+                    [Adventurer::new(Warrior, 4, 9, "Warrior"), Adventurer::new(Mage, 6, 3, "Mage")],
                 )
             })
             .collect()

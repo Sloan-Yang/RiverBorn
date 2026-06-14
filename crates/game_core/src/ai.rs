@@ -55,9 +55,9 @@ mod tests {
     fn players() -> Vec<Player> {
         use Class::*;
         vec![
-            Player::new(0, "AI0", true, 200, [Adventurer::new(Warrior, 4, 9), Adventurer::new(Cleric, 2, 6)]),
-            Player::new(1, "AI1", true, 200, [Adventurer::new(Mage, 6, 3), Adventurer::new(Rogue, 5, 4)]),
-            Player::new(2, "AI2", true, 200, [Adventurer::new(Ranger, 4, 5), Adventurer::new(Warrior, 3, 8)]),
+            Player::new(0, "AI0", true, 200, [Adventurer::new(Warrior, 4, 9, "Warrior"), Adventurer::new(Cleric, 2, 6, "Cleric")]),
+            Player::new(1, "AI1", true, 200, [Adventurer::new(Mage, 6, 3, "Mage"), Adventurer::new(Rogue, 5, 4, "Rogue")]),
+            Player::new(2, "AI2", true, 200, [Adventurer::new(Ranger, 4, 5, "Archer"), Adventurer::new(Warrior, 3, 8, "Knight")]),
         ]
     }
 
