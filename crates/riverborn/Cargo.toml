@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 game_core = { path = "../game_core" }
 bevy = "0.15"
+
+# 强制 blake3 用纯 Rust 实现，绕过 MSYS2 gcc 编译 C/SIMD 失败的问题。
+# blake3 在 Bevy 里只做资源哈希，纯 Rust 版对本游戏无性能影响。
+blake3 = { version = "1", features = ["pure"] }

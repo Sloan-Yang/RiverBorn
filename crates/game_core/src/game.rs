@@ -277,15 +277,12 @@ impl Game {
     /// 简化的占位平衡：队伍战力/生命由「2 底牌 + 公共池里的角色与装备」汇总，
     /// 逐个节点结算。真正的数值/克制平衡后续再调，这里只保证流程闭环。
     pub fn settle(&self) -> Settlement {
-        let team_buff = community_team_buff(&self.community);
-
         let mut results = Vec::new();
         for p in &self.players {
             if !p.is_in_hand() {
                 continue;
             }
-            let team = build_team(&p.hole, team_buff);
-            let outcome = run_dungeon(team, &self.dungeon);
+            let outcome = self.simulate_clear(&p.hole);
             results.push(PlayerResult {
                 id: p.id,
                 cleared: outcome.is_some(),
@@ -305,6 +302,14 @@ impl Game {
             winner,
             results,
         }
+    }
+
+    /// 用给定底牌 + 当前已揭示的公共池，跑当前已揭示的地牢。
+    /// 返回通关后剩余生命（None = 团灭）。AI 用它来估手牌强弱。
+    pub fn simulate_clear(&self, hole: &[Adventurer; 2]) -> Option<u32> {
+        let buff = community_team_buff(&self.community);
+        let team = build_team(hole, buff);
+        run_dungeon(team, &self.dungeon)
     }
 }
 
