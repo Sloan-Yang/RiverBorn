@@ -8,6 +8,9 @@ use crate::cards::*;
 use crate::player::*;
 use crate::rng::Rng;
 
+/// 触发 Boss 狂暴的「单押 all-in」金额下限：押上去 ≥ 这个数才算大额梭哈。
+pub const BIG_ALLIN: u32 = 500;
+
 /// 下注阶段。每个阶段翻开对应的公共牌 / 地牢节点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -50,6 +53,14 @@ pub struct Game {
     /// 自上次加注以来，该玩家是否已经行动过。
     acted: Vec<bool>,
 
+    /// 本手的牌桌场景（给闯关队伍挂 buff）。由 Match 在发牌时设定。
+    pub scene: Scene,
+
+    /// 惊动值：下注越凶，地牢精英/Boss 越危险（见 `combat`）。
+    pub aggro: f32,
+    /// Boss 是否狂暴（有人 All-in 触发，威胁翻倍）。
+    pub boss_berserk: bool,
+
     pub community: Vec<CommunityCard>, // 已翻开的公共牌（最多 5）
     pub dungeon: Vec<Monster>,         // 已翻开的地牢节点（最多 3）
 
@@ -89,6 +100,9 @@ impl Game {
             current_bet: ante, // preflop 大家都已交 ante，下注线 = ante
             to_act: 0,
             acted: vec![false; n],
+            scene: Scene::StoneArena, // 中性默认，Match 发牌时会 set_scene 覆盖
+            aggro: 0.0,
+            boss_berserk: false,
             community: Vec::new(),
             dungeon: Vec::new(),
             community_deck,
@@ -98,6 +112,21 @@ impl Game {
         };
         game.to_act = game.first_to_act();
         game
+    }
+
+    /// 设定本手场景（Match 在发牌后调用）。
+    pub fn set_scene(&mut self, scene: Scene) {
+        self.scene = scene;
+    }
+
+    /// 把彩池滚存等额外筹码并入底池（无人通关时的 jackpot 滚到下一手）。
+    pub fn add_to_pot(&mut self, amount: u32) {
+        self.pot += amount;
+    }
+
+    /// 标记本手已结束（结算完成后由 Match 调用，防止重复结算 / 继续行动）。
+    pub fn finish(&mut self) {
+        self.phase = Phase::Done;
     }
 
     // ---- 查询 ----
@@ -152,6 +181,7 @@ impl Game {
                 if self.players[i].chips == 0 {
                     self.players[i].status = PlayerStatus::AllIn;
                 }
+                self.aggro += 0.5; // 跟注：轻微惊动
             }
             Action::Raise { to } => {
                 if to <= self.current_bet {
@@ -164,14 +194,26 @@ impl Game {
                 self.commit(i, need);
                 self.current_bet = to;
                 self.reset_acted_after_raise(i);
+                self.aggro += 1.0; // 加注：惊动 +1
             }
             Action::AllIn => {
-                let all = self.players[i].chips;
-                self.commit(i, all);
+                let shove = self.players[i].chips; // 这次 all-in 押上的金额
+                self.commit(i, shove);
                 self.players[i].status = PlayerStatus::AllIn;
-                if self.players[i].committed > self.current_bet {
+                let raised = self.players[i].committed > self.current_bet;
+                if raised {
                     self.current_bet = self.players[i].committed;
                     self.reset_acted_after_raise(i);
+                }
+                // 惊动：只有**单押 ≥ 500 的大额 all-in**才让 Boss 狂暴并大幅升惊动；
+                // 小额 all-in（比如只剩 20 块被迫梭）只当普通加注/跟注。
+                if shove >= BIG_ALLIN {
+                    self.aggro += 3.0;
+                    self.boss_berserk = true;
+                } else if raised {
+                    self.aggro += 1.0;
+                } else {
+                    self.aggro += 0.5;
                 }
             }
         }
@@ -233,6 +275,10 @@ impl Game {
     }
 
     fn next_phase(&mut self) {
+        // 火山：每推进一个下注轮，Boss 惊动 +1（拖得越久越热）。
+        if self.scene == Scene::Volcano && matches!(self.phase, Phase::PreFlop | Phase::Flop | Phase::Turn) {
+            self.aggro += 1.0;
+        }
         match self.phase {
             Phase::PreFlop => {
                 self.phase = Phase::Flop;
@@ -264,6 +310,25 @@ impl Game {
     }
 
     fn goto_showdown(&mut self) {
+        // 全员弃牌到只剩一人可能在 River 之前触发摊牌。为了让结算用**完整牌面**、
+        // 并让独狼诈唬也必须跑「小怪 + 精英 + Boss」整条地牢（bluff 规则），
+        // 这里把牌面「跑满」到 River：公共牌补到 5 张，地牢补齐三档各一个。
+        self.deal_community(5usize.saturating_sub(self.community.len()));
+        if self.dungeon.is_empty() {
+            if let Some(m) = self.small_deck.pop() {
+                self.dungeon.push(m);
+            }
+        }
+        if self.dungeon.len() < 2 {
+            if let Some(m) = self.elite_deck.pop() {
+                self.dungeon.push(m);
+            }
+        }
+        if self.dungeon.len() < 3 {
+            if let Some(m) = self.boss_deck.pop() {
+                self.dungeon.push(m);
+            }
+        }
         self.phase = Phase::Showdown;
     }
 
@@ -278,29 +343,45 @@ impl Game {
 
     // ---- 摊牌 / 战斗结算 ----
 
-    /// 对所有未弃牌的玩家跑当前已揭示的地牢，返回结算结果。
-    ///
-    /// 简化的占位平衡：队伍战力/生命由「2 底牌 + 公共池里的角色与装备」汇总，
-    /// 逐个节点结算。真正的数值/克制平衡后续再调，这里只保证流程闭环。
+    /// 对所有未弃牌的玩家跑地牢并结算。每个玩家默认用 `simulate_clear`
+    /// 自动选最优 3 张公共牌（AI 走这条）。
     pub fn settle(&self) -> Settlement {
+        self.settle_inner(None)
+    }
+
+    /// 结算，但指定 `who` 这位玩家用**手动选择**的 3 张公共牌（人类自己点选的）。
+    /// 其余玩家仍自动选最优。
+    pub fn settle_with_selection(&self, who: PlayerId, picks: [usize; 3]) -> Settlement {
+        self.settle_inner(Some((who, picks)))
+    }
+
+    fn settle_inner(&self, manual: Option<(PlayerId, [usize; 3])>) -> Settlement {
         let mut results = Vec::new();
         for p in &self.players {
             if !p.is_in_hand() {
                 continue;
             }
-            let outcome = self.simulate_clear(&p.hole);
+            // 指定玩家用手选的 3 张，其余自动选最优。
+            let r = match manual {
+                Some((id, idx)) if id == p.id => self.clear_with_selection(&p.hole, &idx),
+                _ => self.simulate_clear(&p.hole),
+            };
             results.push(PlayerResult {
                 id: p.id,
-                cleared: outcome.is_some(),
-                remaining_health: outcome.unwrap_or(0),
+                cleared: r.cleared,
+                remaining_health: r.remaining_health,
+                remaining_power: r.remaining_power,
+                advantage: r.advantage(),
+                team_power: r.team_power,
+                team_health: r.team_health,
             });
         }
 
-        // 通关者中剩余生命最高者拿主池；无人通关则主池滚入下一局 jackpot。
+        // 通关者中**战后优势值**最高者拿主池；无人通关则主池滚入下一局 jackpot。
         let winner = results
             .iter()
             .filter(|r| r.cleared)
-            .max_by_key(|r| r.remaining_health)
+            .max_by_key(|r| r.advantage)
             .map(|r| r.id);
 
         Settlement {
@@ -310,73 +391,42 @@ impl Game {
         }
     }
 
-    /// 用给定底牌 + 当前已揭示的公共池，跑当前已揭示的地牢。
-    /// 返回通关后剩余生命（None = 团灭）。AI 用它来估手牌强弱。
-    pub fn simulate_clear(&self, hole: &[Adventurer; 2]) -> Option<u32> {
-        let buff = community_team_buff(&self.community);
-        let team = build_team(hole, buff);
-        run_dungeon(team, &self.dungeon)
+    /// 用**指定**的公共牌下标（玩家手选的 3 张）组队跑地牢，不做枚举择优。
+    /// 越界下标自动忽略；通常传 3 个合法下标。
+    pub fn clear_with_selection(&self, hole: &[Adventurer; 2], indices: &[usize]) -> crate::combat::Report {
+        let picks: Vec<CommunityCard> = indices.iter().filter_map(|&i| self.community.get(i).copied()).collect();
+        crate::combat::resolve(hole, &picks, self.scene, &self.dungeon, self.aggro, self.boss_berserk)
     }
-}
 
-/// 队伍的汇总属性。
-#[derive(Debug, Clone, Copy)]
-struct Team {
-    power: u32,
-    health: u32,
-}
-
-fn build_team(hole: &[Adventurer; 2], buff: (u32, u32)) -> Team {
-    let mut power = buff.0;
-    let mut health = buff.1;
-    for a in hole {
-        power += a.power;
-        health += a.health;
-    }
-    Team { power, health }
-}
-
-/// 公共池里的角色与装备给队伍带来的加成。
-fn community_team_buff(community: &[CommunityCard]) -> (u32, u32) {
-    let mut power = 0;
-    let mut health = 0;
-    for c in community {
-        match c {
-            CommunityCard::Unit(a) => {
-                power += a.power;
-                health += a.health;
-            }
-            CommunityCard::Gear { bonus_power, bonus_health, .. } => {
-                power += bonus_power;
-                health += bonus_health;
+    /// 队伍构成规则：**2 底牌（固定）+ 已翻公共牌里任选 3 张 + 场景效果 = 5 张**。
+    /// 在所有「选 3 张」的组合里挑出**战后优势值最高**的那种（德扑「7 选 5 取最优」）。
+    /// 实际组队/战斗（职业搭配、绑定装备、消耗品、惊动、场景）都在 [`crate::combat`]。
+    /// 返回最优组合的结果（None = 没有任何组合能通关）。settle 与 AI 估牌都走这里。
+    ///
+    /// 已翻公共牌 ≤ 3 张时只能全用（PreFlop 估牌或补满后的牌面）；
+    /// 4/5 张时枚举 C(n,3) 个组合（最多 10 个，开销极小）。
+    pub fn simulate_clear(&self, hole: &[Adventurer; 2]) -> crate::combat::Report {
+        let resolve = |picks: &[CommunityCard]| {
+            crate::combat::resolve(hole, picks, self.scene, &self.dungeon, self.aggro, self.boss_berserk)
+        };
+        let n = self.community.len();
+        if n <= 3 {
+            return resolve(&self.community);
+        }
+        // 枚举所有「选 3 张」组合，取最优（通关优先，否则比队伍强度）。
+        let mut best: Option<crate::combat::Report> = None;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                for k in (j + 1)..n {
+                    let r = resolve(&[self.community[i], self.community[j], self.community[k]]);
+                    if best.map_or(true, |b| r.pick_score() > b.pick_score()) {
+                        best = Some(r);
+                    }
+                }
             }
         }
+        best.expect("n>3 必有组合")
     }
-    (power, health)
-}
-
-/// 跑地牢：逐节点结算。返回通关后剩余生命，团灭返回 None。
-fn run_dungeon(mut team: Team, dungeon: &[Monster]) -> Option<u32> {
-    for node in dungeon {
-        // 毒沼泽：克制低生命队伍，额外掉血。
-        if node.kind == MonsterKind::PoisonSwamp && team.health < node.health {
-            team.health = team.health.saturating_sub(node.threat / 2);
-        }
-        // 宝箱无威胁，跳过。
-        if node.kind == MonsterKind::Treasure {
-            continue;
-        }
-        // 战力压不过威胁 → 打不动 → 团灭。
-        if team.power < node.threat {
-            return None;
-        }
-        // 承伤 = 节点威胁；扛不住则团灭。
-        if team.health <= node.threat {
-            return None;
-        }
-        team.health -= node.threat;
-    }
-    Some(team.health)
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +434,12 @@ pub struct PlayerResult {
     pub id: PlayerId,
     pub cleared: bool,
     pub remaining_health: u32,
+    pub remaining_power: u32,
+    /// 战后优势值（赢家判定依据）。
+    pub advantage: u32,
+    /// 起始队伍战力 / 生命（计分板展示用，团灭时也有值）。
+    pub team_power: u32,
+    pub team_health: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -396,56 +452,94 @@ pub struct Settlement {
 
 // ---- 占位牌库（之后替换为真正的卡牌设计）----
 
-// art 名对应 assets/cards/community/<art>.png。
+// art 名对应 assets/cards/community/<art>.png。角色 / 绑定装备 / 战术消耗品三类。
 fn sample_community_deck() -> Vec<CommunityCard> {
     use Class::*;
     fn unit(class: Class, p: u32, h: u32, art: &'static str) -> CommunityCard {
         CommunityCard::Unit(Adventurer::new(class, p, h, art))
     }
-    fn gear(p: u32, h: u32, art: &'static str) -> CommunityCard {
-        CommunityCard::Gear { bonus_power: p, bonus_health: h, art }
-    }
+    use CommunityCard::{Consum, Equip};
     vec![
-        // 角色
-        unit(Warrior, 3, 9, "Warrior"),
-        unit(Warrior, 4, 8, "Knight"),
-        unit(Cleric, 2, 6, "Cleric"),
-        unit(Mage, 7, 2, "Mage"),
-        unit(Rogue, 5, 4, "Rogue"),
-        unit(Ranger, 4, 5, "Archer"),
-        unit(Ranger, 5, 4, "Scout"),
-        // 装备
-        gear(0, 6, "Iron_Shield"),
-        gear(3, 0, "Dagger"),
-        gear(4, 0, "Arcane_Staff"),
-        gear(3, 1, "Longbow"),
-        // 技能 / 药剂
-        gear(5, 0, "Fireball"),
-        gear(0, 5, "Healing_Potion"),
-        gear(0, 4, "Holy_Chalice"),
-        gear(0, 3, "Purify"),
-        gear(2, 1, "Smoke_Bomb"),
+        // 角色：每个职业各 3 张（5 职业 = 15 张），同职业多份方便触发对子/三条。
+        // 战士（高血肉盾）
+        unit(Warrior, 4, 12, "Warrior"),
+        unit(Warrior, 5, 11, "Knight"),
+        unit(Warrior, 6, 10, "Knight"),
+        // 神官（治疗/高血）
+        unit(Cleric, 3, 10, "Cleric"),
+        unit(Cleric, 4, 9, "Cleric"),
+        unit(Cleric, 3, 11, "Cleric"),
+        // 法师（高战力脆皮）
+        unit(Mage, 10, 4, "Mage"),
+        unit(Mage, 9, 5, "Mage"),
+        unit(Mage, 11, 3, "Mage"),
+        // 盗贼（爆发）
+        unit(Rogue, 8, 6, "Rogue"),
+        unit(Rogue, 7, 7, "Rogue"),
+        unit(Rogue, 9, 5, "Rogue"),
+        // 游侠（远程均衡）
+        unit(Ranger, 7, 7, "Archer"),
+        unit(Ranger, 8, 6, "Scout"),
+        unit(Ranger, 6, 9, "Archer"),
+        // 绑定装备（需对应职业在场才生效）
+        Equip(EquipKind::IronShield),  // 战士
+        Equip(EquipKind::Dagger),      // 盗贼
+        Equip(EquipKind::ArcaneStaff), // 法师
+        Equip(EquipKind::Longbow),     // 游侠
+        Equip(EquipKind::HolyChalice), // 神官
+        // 战术 / 消耗品
+        Consum(ConsumKind::Fireball),
+        Consum(ConsumKind::HealingPotion),
+        Consum(ConsumKind::Purify),
+        Consum(ConsumKind::SmokeBomb),
     ]
+}
+
+/// 冒险者底牌库：每手洗牌后给每个座位发 2 张（允许重复）。
+/// 只有 7 种立绘（对应 assets/cards/community/<art>.png 里的角色），
+/// 这里给每种放数张，凑够 6 人×2=12 张还有富余。数值即平衡点，可调。
+pub fn sample_adventurer_deck() -> Vec<Adventurer> {
+    use Class::*;
+    let kinds = [
+        (Warrior, 5, 12, "Warrior"),
+        (Warrior, 6, 11, "Knight"),
+        (Cleric, 4, 10, "Cleric"),
+        (Mage, 10, 4, "Mage"),
+        (Mage, 9, 5, "Mage"),
+        (Rogue, 8, 6, "Rogue"),
+        (Ranger, 7, 7, "Archer"),
+        (Ranger, 8, 6, "Scout"),
+    ];
+    let mut deck = Vec::with_capacity(kinds.len() * 3);
+    for _ in 0..3 {
+        for &(class, p, h, art) in &kinds {
+            deck.push(Adventurer::new(class, p, h, art));
+        }
+    }
+    deck
 }
 
 // art 名对应 assets/cards/dungeon/<art>.png。三档分别在 Flop/Turn/River 翻开。
 fn sample_dungeon_decks() -> (Vec<Monster>, Vec<Monster>, Vec<Monster>) {
     use MonsterKind::*;
+    // 一手要连过 小怪→精英→Boss 三关：队伍 power 需压过每关 threat，
+    // health 逐关扣对应 threat。基础威胁总和约 5+8+12=25，搭得好的队（含对子/
+    // 装备）约 40 战力 / 50 生命能稳过；惊动值高或 All-in 狂暴时会顶不住。
     let smalls = vec![
-        Monster::new(Goblin, 5, 4, "Goblin"),
-        Monster::new(Goblin, 6, 5, "Skeleton_Soldier"),
-        Monster::new(Goblin, 7, 4, "Dire_Wolf"),
+        Monster::new(Goblin, 4, 5, "Goblin"),
+        Monster::new(Goblin, 5, 6, "Skeleton_Soldier"),
+        Monster::new(Goblin, 6, 5, "Dire_Wolf"),
     ];
     let elites = vec![
-        Monster::new(Elite, 9, 8, "Elite_Goblin-Chief"),
-        Monster::new(Elite, 8, 9, "Elite_Mimic"),
-        Monster::new(PoisonSwamp, 9, 12, "Elite_Swamp_Witch"),
+        Monster::new(Elite, 8, 10, "Elite_Goblin-Chief"),
+        Monster::new(Elite, 7, 11, "Elite_Mimic"),
+        Monster::new(PoisonSwamp, 8, 12, "Elite_Swamp_Witch"),
     ];
     let bosses = vec![
-        Monster::new(Boss, 15, 18, "Boss_Ancient_Dragon"),
-        Monster::new(Boss, 14, 16, "Boss_Troll_King"),
-        Monster::new(Boss, 13, 17, "Boss_lich"),
-        Monster::new(Boss, 14, 17, "Boss_Corrupted_Tree_Lord"),
+        Monster::new(Boss, 13, 20, "Boss_Ancient_Dragon"),
+        Monster::new(Boss, 12, 18, "Boss_Troll_King"),
+        Monster::new(Boss, 11, 19, "Boss_lich"),
+        Monster::new(Boss, 12, 19, "Boss_Corrupted_Tree_Lord"),
     ];
     (smalls, elites, bosses)
 }
@@ -514,6 +608,107 @@ mod tests {
         // 只剩 P0，但 README 的 bluff 规则：仍要跑地牢才算赢。
         assert_eq!(g.phase, Phase::Showdown);
         assert_eq!(g.players_in_hand(), 1);
+    }
+
+    #[test]
+    fn team_caps_at_three_community_cards() {
+        use Class::*;
+        // 5 张同质公共牌(各 P5/H5)，队伍只能取其中 3 张：用满 5 张血会更高，
+        // 用 3 张则余血固定 → 以此验证「最多取 3 张」。
+        let hole = [Adventurer::new(Warrior, 0, 0, "Warrior"), Adventurer::new(Warrior, 0, 0, "Warrior")];
+        let mut g = Game::new(demo_players(2, 200), 10, 5);
+        g.community = (0..5).map(|_| CommunityCard::Unit(Adventurer::new(Warrior, 5, 5, "Warrior"))).collect();
+        g.dungeon = vec![Monster::new(MonsterKind::Boss, 20, 20, "Boss")];
+        g.scene = Scene::StoneArena; // 战力 +2
+        // 取 3 张：5 个战士(2 底牌+3) → 三条 +12/+12。
+        // 战力 = 0+0 + 15 + 12 + 2 = 29；生命 = 0 + 15 + 12 = 27；过 Boss(威胁20) 余血 = 7。
+        let o = g.simulate_clear(&hole);
+        assert!(o.cleared);
+        assert_eq!(o.remaining_health, 7, "用 4/5 张会让余血更高，余血=7 证明只取了 3 张");
+        assert_eq!(o.remaining_power, 29);
+    }
+
+    #[test]
+    fn class_pair_and_triple_synergy() {
+        use Class::*;
+        // 两个法师 → 对子 +6/+6。
+        let hole = [Adventurer::new(Mage, 5, 2, "Mage"), Adventurer::new(Mage, 5, 2, "Mage")];
+        let mut g = Game::new(demo_players(2, 200), 10, 1);
+        g.community = vec![]; // 0 张公共牌：只看底牌 + 搭配
+        g.dungeon = vec![]; // 空地牢：必通关，便于读数值
+        g.scene = Scene::StoneArena; // +2 战力
+        let o = g.simulate_clear(&hole);
+        // 战力 = 5+5 + 6(对子) + 2(场景) = 18；生命 = 2+2 + 6 = 10。
+        assert_eq!(o.team_power, 18);
+        assert_eq!(o.team_health, 10);
+    }
+
+    #[test]
+    fn equipment_needs_bound_class() {
+        use Class::*;
+        let mut g = Game::new(demo_players(2, 200), 10, 1);
+        g.dungeon = vec![];
+        g.scene = Scene::Tomb; // flat (+1,-1)，固定可预期
+        // 法杖给战士：不生效。
+        let warriors = [Adventurer::new(Warrior, 3, 5, "Warrior"), Adventurer::new(Rogue, 3, 5, "Rogue")];
+        g.community = vec![CommunityCard::Equip(EquipKind::ArcaneStaff)];
+        let no = g.simulate_clear(&warriors);
+        // 战力 = 3+3 +1(场景) = 7（法杖无效）。
+        assert_eq!(no.team_power, 7);
+        // 法杖给法师：+6 战力。
+        let mage = [Adventurer::new(Mage, 3, 5, "Mage"), Adventurer::new(Rogue, 3, 5, "Rogue")];
+        let yes = g.simulate_clear(&mage);
+        assert_eq!(yes.team_power, 7 + 6, "队伍有法师，法杖应生效 +6 战力");
+    }
+
+    #[test]
+    fn allin_berserk_adds_boss_threat() {
+        use Class::*;
+        // 两个战士 → 对子 +6/+6；战力/生命都留足够余量扛住狂暴威胁。
+        let hole = [Adventurer::new(Warrior, 50, 45, "Warrior"), Adventurer::new(Warrior, 0, 0, "Warrior")];
+        let mut g = Game::new(demo_players(2, 200), 10, 1);
+        g.community = vec![];
+        g.scene = Scene::StoneArena; // +2 战力
+        g.dungeon = vec![Monster::new(MonsterKind::Boss, 20, 100, "Boss")];
+        // 战力 = 50+6+2 = 58；生命 = 45+6 = 51。
+        let calm = g.simulate_clear(&hole); // 余血 51-20 = 31
+        g.boss_berserk = true; // 威胁 +10 → 30
+        let rage = g.simulate_clear(&hole); // 余血 51-30 = 21
+        assert!(calm.cleared && rage.cleared);
+        assert_eq!(calm.remaining_health - rage.remaining_health, 10, "狂暴让 Boss 威胁 +10(20→30)");
+    }
+
+    #[test]
+    fn small_allin_does_not_trigger_berserk() {
+        // 只剩很少筹码被迫梭哈，不应触发 Boss 狂暴。
+        let mut g = Game::new(demo_players(2, 1000), 10, 1);
+        g.players[0].chips = 20; // 让 P0 只剩 20
+        g.to_act = 0;
+        g.apply(Action::AllIn).unwrap();
+        assert!(!g.boss_berserk, "小额 all-in 不该触发狂暴");
+
+        // 大额 all-in（≥500）才触发。
+        let mut g2 = Game::new(demo_players(2, 1000), 10, 2);
+        g2.to_act = 0;
+        g2.apply(Action::AllIn).unwrap(); // P0 押上约 990
+        assert!(g2.boss_berserk, "大额 all-in 应触发狂暴");
+    }
+
+    #[test]
+    fn early_allfold_runs_out_full_board() {
+        // 全员翻牌前弃到只剩一人：应把牌面跑满到 River —— 5 张公共牌 + 完整地牢
+        // (小怪+精英+Boss)，独狼诈唬也得跑全程。
+        let mut g = Game::new(demo_players(3, 200), 10, 3);
+        g.apply(Action::Raise { to: 40 }).unwrap();
+        g.apply(Action::Fold).unwrap();
+        g.apply(Action::Fold).unwrap();
+        assert_eq!(g.phase, Phase::Showdown);
+        assert_eq!(g.community.len(), 5, "早摊牌应补满 5 张公共牌");
+        assert_eq!(g.dungeon.len(), 3, "早摊牌应补齐完整地牢三档");
+        // 地牢按 小怪→精英→Boss 顺序补齐。
+        assert_eq!(g.dungeon[0].kind, MonsterKind::Goblin);
+        assert_eq!(g.dungeon[2].kind, MonsterKind::Boss);
+        let _ = g.settle(); // 不应 panic，能正常结算
     }
 
     #[test]

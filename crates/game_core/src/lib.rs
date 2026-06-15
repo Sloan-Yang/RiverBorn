@@ -6,10 +6,14 @@
 
 pub mod ai;
 pub mod cards;
+pub mod combat;
 pub mod game;
 pub mod player;
 pub mod rng;
+pub mod table;
 
 pub use cards::*;
+pub use combat::Report;
 pub use game::*;
 pub use player::*;
+pub use table::*;
