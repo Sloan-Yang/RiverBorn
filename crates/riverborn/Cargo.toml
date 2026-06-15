@@ -17,3 +17,14 @@ blake3 = { version = "1", features = ["pure"] }
 # 版本与 Bevy 0.15 内部使用的一致，cargo 会复用同一实例。
 winit = "0.30"
 image = "0.25"
+
+# 联机：bevy_renet（传输，内部含 renet + netcode）+ 共享协议。
+# 必须用 1.0：它依赖 bevy_ecs 0.15，和我们的 bevy 0.15 匹配；
+# 2.0/3.0/4.0 分别要 bevy 0.16/0.17/0.18，会出现「两个 bevy_ecs」导致 RenetClient 不是 Resource。
+riverborn_net = { path = "../riverborn_net" }
+bevy_renet = { version = "1.0", features = ["netcode"] }
+# 必须钉死 =1.0.0：renet 1.1/1.2 的 bevy feature 升到了 bevy_ecs 0.16/0.17，
+# 会和我们的 bevy 0.15 冲突（出现第二个 bevy_ecs，RenetClient 就不是 Resource 了）。
+renet = "=1.0.0"
+renet_netcode = "=1.0.0"
+serde_json = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "riverborn_net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 客户端与服务器共享的「线上协议」：消息类型 + 序列化。
+# 依赖 game_core（开 serde feature）以复用 Action/Phase/PlayerStatus/Settlement 等类型。
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+game_core = { path = "../game_core", features = ["serde"] }

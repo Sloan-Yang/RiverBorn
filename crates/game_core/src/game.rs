@@ -12,6 +12,7 @@ use crate::rng::Rng;
 pub const BIG_ALLIN: u32 = 500;
 
 /// 下注阶段。每个阶段翻开对应的公共牌 / 地牢节点。
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     PreFlop, // 只看底牌下注
@@ -23,6 +24,7 @@ pub enum Phase {
 }
 
 /// 玩家在某个下注轮可以做的动作。
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Fold,
@@ -346,25 +348,21 @@ impl Game {
     /// 对所有未弃牌的玩家跑地牢并结算。每个玩家默认用 `simulate_clear`
     /// 自动选最优 3 张公共牌（AI 走这条）。
     pub fn settle(&self) -> Settlement {
-        self.settle_inner(None)
+        self.settle_with(&[])
     }
 
-    /// 结算，但指定 `who` 这位玩家用**手动选择**的 3 张公共牌（人类自己点选的）。
-    /// 其余玩家仍自动选最优。
-    pub fn settle_with_selection(&self, who: PlayerId, picks: [usize; 3]) -> Settlement {
-        self.settle_inner(Some((who, picks)))
-    }
-
-    fn settle_inner(&self, manual: Option<(PlayerId, [usize; 3])>) -> Settlement {
+    /// 结算，但 `picks` 里列出的玩家用**手动选择**的 3 张公共牌（人类自己点选的）。
+    /// 其余玩家（AI / 未提交的人类）自动选最优。联机里多个人类各自提交。
+    pub fn settle_with(&self, picks: &[(PlayerId, [usize; 3])]) -> Settlement {
         let mut results = Vec::new();
         for p in &self.players {
             if !p.is_in_hand() {
                 continue;
             }
-            // 指定玩家用手选的 3 张，其余自动选最优。
-            let r = match manual {
-                Some((id, idx)) if id == p.id => self.clear_with_selection(&p.hole, &idx),
-                _ => self.simulate_clear(&p.hole),
+            // 该玩家若有手选则用手选的 3 张，否则自动选最优。
+            let r = match picks.iter().find(|(id, _)| *id == p.id) {
+                Some((_, idx)) => self.clear_with_selection(&p.hole, idx),
+                None => self.simulate_clear(&p.hole),
             };
             results.push(PlayerResult {
                 id: p.id,
@@ -429,6 +427,7 @@ impl Game {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct PlayerResult {
     pub id: PlayerId,
@@ -442,6 +441,7 @@ pub struct PlayerResult {
     pub team_health: u32,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct Settlement {
     pub pot: u32,

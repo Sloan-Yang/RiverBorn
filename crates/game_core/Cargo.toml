@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# 关键约束：核心逻辑库零依赖、不依赖 Bevy。
-# 这样下注/战斗规则可以用 `cargo test -p game_core` 秒级验证，
-# 之后做联机也能直接复用这套确定性逻辑。
+# 关键约束：核心逻辑库**默认零依赖**、不依赖 Bevy。
+# 联机需要把部分数据类型序列化，用可选 feature `serde` 开启，默认仍零依赖。
 [dependencies]
+serde = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde"]

@@ -163,18 +163,13 @@ impl Match {
     /// 结算当前这一手：底池入账、写回座位筹码、对负债计息。
     /// 幂等：只在首次（Showdown 且未结算）真正入账，之后返回缓存结果。
     ///
-    /// `human_pick`：人类玩家手选的 3 张公共牌下标（点选交互的结果）。
-    /// 传 `None` 则人类也自动选最优（如人类已弃牌、或无人类）。AI 始终自动选。
-    pub fn settle_hand(&mut self, human_pick: Option<[usize; 3]>) -> Settlement {
+    /// `picks`：各人类玩家手选的 3 张公共牌下标（按 PlayerId）。空切片=全部自动选最优。
+    /// 联机里多个人类各自提交；单机就传一个元素。AI / 未提交者始终自动选。
+    pub fn settle_hand(&mut self, picks: &[(PlayerId, [usize; 3])]) -> Settlement {
         if self.settled {
             return self.last.clone().expect("settled 时 last 必有值");
         }
-        // 找到人类座位，把它的手选传给单手结算。
-        let human_id = self.seats.iter().find(|s| !s.is_ai).map(|s| s.id);
-        let s = match (human_id, human_pick) {
-            (Some(id), Some(picks)) => self.hand.settle_with_selection(id, picks),
-            _ => self.hand.settle(),
-        };
+        let s = self.hand.settle_with(picks);
 
         // 底池入账：有赢家发给赢家，否则滚存到下一手。
         if let Some(winner_id) = s.winner {
@@ -281,10 +276,10 @@ mod tests {
         }
         assert!(m.hand_over());
         let pot = m.hand.pot;
-        let s1 = m.settle_hand(None);
+        let s1 = m.settle_hand(&[]);
         let total_after: u32 = m.seats.iter().map(|x| x.chips).sum();
         // 二次结算应返回相同结果且不再二次发钱。
-        let s2 = m.settle_hand(None);
+        let s2 = m.settle_hand(&[]);
         assert_eq!(s1.winner, s2.winner);
         let total_again: u32 = m.seats.iter().map(|x| x.chips).sum();
         assert_eq!(total_after, total_again);
@@ -309,7 +304,7 @@ mod tests {
             m.hand.apply(action).unwrap();
             guard += 1;
         }
-        m.settle_hand(None);
+        m.settle_hand(&[]);
         assert!(m.seats[1].debt > debt0, "负债应因计息增长");
     }
 
@@ -327,7 +322,7 @@ mod tests {
                     m.hand.apply(crate::ai::decide(&m.hand, idx)).unwrap();
                     guard += 1;
                 }
-                let s = m.settle_hand(None);
+                let s = m.settle_hand(&[]);
                 hands += 1;
                 if s.winner.is_some() {
                     cleared += 1;
@@ -354,7 +349,7 @@ mod tests {
             m.hand.apply(crate::ai::decide(&m.hand, idx)).unwrap();
             guard += 1;
         }
-        m.settle_hand(None);
+        m.settle_hand(&[]);
         m.next_hand();
         assert_eq!(m.hand_no, 1);
         assert_eq!(m.button, (btn0 + 1) % m.seats.len());

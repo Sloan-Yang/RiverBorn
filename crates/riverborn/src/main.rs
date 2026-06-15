@@ -9,10 +9,18 @@
 //! 进入单人时按原坐标摆放、离开时整体清理；规则全在 game_core。
 
 use bevy::audio::{AudioPlayer, AudioSource, PlaybackSettings};
+use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy::winit::WinitWindows;
+use bevy_renet::netcode::{ClientAuthentication, NetcodeClientPlugin, NetcodeClientTransport};
+use bevy_renet::renet::{ConnectionConfig, DefaultChannel, RenetClient};
+use bevy_renet::RenetClientPlugin;
 use game_core::{Action, Match, Phase, SeatDef};
+use riverborn_net::{ClientMsg, PlayerId, RoomInfo, RoomState, ServerMsg, DEFAULT_PORT, PROTOCOL_ID};
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{SystemTime, UNIX_EPOCH};
 use winit::window::Icon;
 
 // ============================ 状态 ============================
@@ -36,6 +44,16 @@ enum PauseState {
     Running,
     Paused,
     Settings,
+}
+
+/// 联机内的子状态（只在 Multiplayer 下存在）：输入名字 → 大厅 → 房间。
+#[derive(SubStates, Default, Debug, Clone, PartialEq, Eq, Hash)]
+#[source(AppState = AppState::Multiplayer)]
+enum MpState {
+    #[default]
+    NameEntry,
+    Menu,
+    Lobby,
 }
 
 // ============================ 资源 ============================
@@ -80,6 +98,44 @@ enum Slot {
 /// 单机对局的玩家人数（含人类），在选人数页面设定。
 #[derive(Resource)]
 struct PlayerCount(usize);
+
+/// 联机会话状态（只在 Multiplayer 期间存在）。
+#[derive(Resource, Default)]
+struct Net {
+    my_id: Option<PlayerId>,
+    name: String,         // 已确认的名字
+    greeted: bool,        // 是否已向服务器发过 Hello
+    name_input: String,   // 名字输入框内容
+    code_input: String,   // 房间号输入框内容
+    rooms: Vec<RoomInfo>, // 搜索到的房间
+    room: Option<RoomState>, // 当前所在房间
+    status: String,       // 提示 / 错误
+}
+
+/// 联机各子屏的根标记（OnExit 清理）。
+#[derive(Component)]
+struct MpUi;
+
+/// 联机界面按钮。
+#[derive(Component)]
+enum MpButton {
+    Confirm,       // 名字确定
+    Create(usize), // 创建指定人数的房间
+    Refresh,       // 刷新房间列表
+    Join,          // 按房间号加入
+    Start,         // 房主开始
+    Leave,         // 离开房间
+}
+
+/// 联机界面里随 Net 刷新的文字。
+#[derive(Component)]
+enum MpText {
+    NameInput,
+    CodeInput,
+    RoomList,
+    Lobby,
+    Status,
+}
 
 /// 主菜单按钮。
 #[derive(Component)]
@@ -215,8 +271,10 @@ fn main() {
             ..default()
         }))
         .insert_resource(ClearColor(Color::srgb(0.08, 0.09, 0.12)))
+        .add_plugins((RenetClientPlugin, NetcodeClientPlugin))
         .init_state::<AppState>()
         .add_sub_state::<PauseState>()
+        .add_sub_state::<MpState>()
         .add_systems(Startup, (setup, set_window_icon))
         .add_systems(Update, apply_ui_font)
         // 主菜单
@@ -259,8 +317,21 @@ fn main() {
         .add_systems(OnEnter(PauseState::Settings), enter_pause_settings)
         .add_systems(OnExit(PauseState::Paused), cleanup_pause)
         .add_systems(OnExit(PauseState::Settings), cleanup_pause)
-        // 多人 / 设置（占位）
-        .add_systems(OnEnter(AppState::Multiplayer), enter_multiplayer)
+        // 多人联机：连接 + 子屏（输入名字 / 大厅 / 房间）
+        .add_systems(OnEnter(AppState::Multiplayer), mp_connect)
+        .add_systems(OnExit(AppState::Multiplayer), mp_disconnect)
+        .add_systems(
+            Update,
+            (mp_receive, mp_send_hello, mp_buttons, mp_text_input, mp_refresh_ui)
+                .run_if(in_state(AppState::Multiplayer)),
+        )
+        .add_systems(OnEnter(MpState::NameEntry), enter_name_entry)
+        .add_systems(OnEnter(MpState::Menu), enter_mp_menu)
+        .add_systems(OnEnter(MpState::Lobby), enter_lobby)
+        .add_systems(OnExit(MpState::NameEntry), cleanup_mp)
+        .add_systems(OnExit(MpState::Menu), cleanup_mp)
+        .add_systems(OnExit(MpState::Lobby), cleanup_mp)
+        // 设置（占位）
         .add_systems(OnEnter(AppState::Settings), enter_settings)
         // 多人/设置顶层页面按 Esc 返回主菜单（单人的 Esc 交给 pause_input）
         .add_systems(
@@ -981,20 +1052,360 @@ fn status_text(m: &Match) -> String {
     s
 }
 
-// ============================ 多人 / 设置（占位）============================
+// ============================ 多人联机（阶段 1：大厅）============================
 
-fn enter_multiplayer(mut commands: Commands) {
-    let plan = "\
-联机部分尚未实现，先放规划：
-
-· 架构：服务器权威。发牌/下注/战斗结算都在服务器用 game_core 跑，\n  客户端只发动作、收状态。
-· 隐藏信息：底牌只下发给本人，摊牌前对手底牌不出现在该客户端。
-· 同步：bevy_replicon 或 lightyear 做状态复制；game_core 的确定性\n  + 固定 seed 便于对齐。
-· 大厅：创建/加入房间，2–6 人入座后开局。
-
-（game_core 已与引擎解耦，这些都能直接复用现有规则逻辑。）";
-    spawn_info_screen(&mut commands, "Multiplayer — Coming Soon", plan);
+/// 服务器地址。优先级：命令行参数 > 环境变量 RIVERBORN_SERVER > 默认公网 IP。
+/// 本地调试用：`cargo run -p riverborn -- 127.0.0.1:7777`
+/// （WSL 跑 Windows exe 时 `VAR=值 cargo.exe` 那种前缀不会把环境变量透传给 Windows 进程，用参数最稳）。
+fn server_addr() -> SocketAddr {
+    let raw = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("RIVERBORN_SERVER").ok())
+        .unwrap_or_else(|| format!("43.155.246.125:{DEFAULT_PORT}"));
+    raw.parse().unwrap_or_else(|_| {
+        error!("服务器地址应为 ip:port，收到 `{raw}`，回退默认公网地址");
+        format!("43.155.246.125:{DEFAULT_PORT}").parse().unwrap()
+    })
 }
+
+/// 进入联机：建立到服务器的连接，初始化会话状态。
+fn mp_connect(mut commands: Commands) {
+    let server = server_addr();
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(e) => {
+            error!("绑定本地 UDP 失败: {e}");
+            return;
+        }
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let client_id = now.as_nanos() as u64; // 随机化的客户端 id
+    let auth = ClientAuthentication::Unsecure {
+        server_addr: server,
+        client_id,
+        user_data: None,
+        protocol_id: PROTOCOL_ID,
+    };
+    match NetcodeClientTransport::new(now, auth, socket) {
+        Ok(transport) => {
+            commands.insert_resource(RenetClient::new(ConnectionConfig::default()));
+            commands.insert_resource(transport);
+            commands.insert_resource(Net::default());
+            info!("连接服务器 {server} ...");
+        }
+        Err(e) => error!("创建连接失败: {e}"),
+    }
+}
+
+/// 离开联机：断开并清理资源。
+fn mp_disconnect(mut commands: Commands, client: Option<ResMut<RenetClient>>) {
+    if let Some(mut c) = client {
+        c.disconnect();
+    }
+    commands.remove_resource::<RenetClient>();
+    commands.remove_resource::<NetcodeClientTransport>();
+    commands.remove_resource::<Net>();
+}
+
+/// 连接成功且名字已定后，发一次 Hello 报名。
+fn mp_send_hello(client: Option<ResMut<RenetClient>>, net: Option<ResMut<Net>>) {
+    let (Some(mut client), Some(mut net)) = (client, net) else { return };
+    if net.greeted || net.name.is_empty() || !client.is_connected() {
+        return;
+    }
+    client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::Hello { name: net.name.clone() }.encode());
+    net.greeted = true;
+}
+
+/// 收服务器消息，更新会话状态并切换子屏。
+fn mp_receive(
+    client: Option<ResMut<RenetClient>>,
+    net: Option<ResMut<Net>>,
+    mut mp_next: ResMut<NextState<MpState>>,
+) {
+    let (Some(mut client), Some(mut net)) = (client, net) else { return };
+    while let Some(bytes) = client.receive_message(DefaultChannel::ReliableOrdered) {
+        let Some(msg) = ServerMsg::decode(&bytes) else { continue };
+        match msg {
+            ServerMsg::Welcome { your_id } => net.my_id = Some(your_id),
+            ServerMsg::RoomList { rooms } => net.rooms = rooms,
+            ServerMsg::Joined { room } => {
+                net.room = Some(room);
+                net.status.clear();
+                mp_next.set(MpState::Lobby);
+            }
+            ServerMsg::RoomUpdate { room } => net.room = Some(room),
+            ServerMsg::Left => {
+                net.room = None;
+                mp_next.set(MpState::Menu);
+            }
+            ServerMsg::Error { text } => net.status = format!("⚠ {text}"),
+            ServerMsg::GameStarting => net.status = "游戏即将开始（对局功能在阶段 2）".into(),
+        }
+    }
+}
+
+/// 把键盘输入收进当前子屏对应的输入框。
+fn mp_text_input(state: Res<State<MpState>>, net: Option<ResMut<Net>>, mut ev: EventReader<KeyboardInput>) {
+    let Some(mut net) = net else { return };
+    match state.get() {
+        MpState::NameEntry => type_into(&mut net.name_input, &mut ev, 16),
+        MpState::Menu => type_into(&mut net.code_input, &mut ev, 8),
+        _ => {}
+    }
+}
+
+/// 通用文本输入：把按键收进字符串（含退格）。
+fn type_into(s: &mut String, ev: &mut EventReader<KeyboardInput>, max: usize) {
+    for e in ev.read() {
+        if e.state != ButtonState::Pressed {
+            continue;
+        }
+        match &e.logical_key {
+            Key::Character(text) => {
+                for ch in text.chars() {
+                    if !ch.is_control() && s.chars().count() < max {
+                        s.push(ch);
+                    }
+                }
+            }
+            Key::Space if s.chars().count() < max => s.push(' '),
+            Key::Backspace => {
+                s.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 处理联机界面所有按钮。
+fn mp_buttons(
+    mut q: Query<(&Interaction, &MpButton, &mut BackgroundColor), Changed<Interaction>>,
+    client: Option<ResMut<RenetClient>>,
+    net: Option<ResMut<Net>>,
+    mut mp_next: ResMut<NextState<MpState>>,
+) {
+    let (Some(mut client), Some(mut net)) = (client, net) else { return };
+    for (interaction, btn, mut bg) in &mut q {
+        match interaction {
+            Interaction::Pressed => match btn {
+                MpButton::Confirm => {
+                    let name = net.name_input.trim().to_string();
+                    net.name = if name.is_empty() { "Player".into() } else { name };
+                    mp_next.set(MpState::Menu);
+                }
+                MpButton::Create(n) => {
+                    let room_name = format!("{}的房间", net.name);
+                    let msg = ClientMsg::CreateRoom { room_name, max_players: *n, fill_ai: true };
+                    client.send_message(DefaultChannel::ReliableOrdered, msg.encode());
+                }
+                MpButton::Refresh => client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::ListRooms.encode()),
+                MpButton::Join => {
+                    let code = net.code_input.trim().to_uppercase();
+                    if !code.is_empty() {
+                        client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::JoinRoom { code }.encode());
+                    }
+                }
+                MpButton::Start => client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::StartGame.encode()),
+                MpButton::Leave => client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::LeaveRoom.encode()),
+            },
+            Interaction::Hovered => bg.0 = BTN_HOVER,
+            Interaction::None => bg.0 = BTN_NORMAL,
+        }
+    }
+}
+
+/// 刷新联机界面里的动态文字（输入框 / 房间列表 / 房间信息 / 提示）。
+fn mp_refresh_ui(net: Option<Res<Net>>, mut q: Query<(&mut Text, &MpText)>) {
+    let Some(net) = net else { return };
+    for (mut text, kind) in &mut q {
+        text.0 = match kind {
+            MpText::NameInput => format!("名字: {}_", net.name_input),
+            MpText::CodeInput => format!("房间号: {}_", net.code_input),
+            MpText::RoomList => rooms_text(&net.rooms),
+            MpText::Lobby => lobby_text(&net),
+            MpText::Status => net.status.clone(),
+        };
+    }
+}
+
+fn rooms_text(rooms: &[RoomInfo]) -> String {
+    if rooms.is_empty() {
+        return "（暂无公开房间，点「刷新列表」或「创建房间」）".into();
+    }
+    let mut s = String::from("公开房间（输入房间号加入）:\n");
+    for r in rooms {
+        s.push_str(&format!("  [{}] {}   {}/{}\n", r.code, r.name, r.players, r.max_players));
+    }
+    s
+}
+
+fn lobby_text(net: &Net) -> String {
+    let Some(room) = &net.room else { return String::new() };
+    let humans = room.players.len();
+    let mut s = format!("房间 [{}]  {}\n人数 {}/{}\n\n", room.code, room.name, humans, room.max_players);
+    for p in &room.players {
+        let host = if p.id == room.host { "  (房主)" } else { "" };
+        let me = if Some(p.id) == net.my_id { "  ←你" } else { "" };
+        s.push_str(&format!("· {}{}{}\n", p.name, host, me));
+    }
+    if room.fill_ai && humans < room.max_players {
+        s.push_str(&format!("\n（开局将补 {} 个 AI 凑满 {} 人）", room.max_players - humans, room.max_players));
+    }
+    s
+}
+
+fn mp_button(parent: &mut ChildBuilder, action: MpButton, label: &str) {
+    parent
+        .spawn((
+            Button,
+            action,
+            Node {
+                width: Val::Px(220.0),
+                height: Val::Px(56.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor(Color::srgb(0.45, 0.48, 0.58)),
+            BackgroundColor(BTN_NORMAL),
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(label),
+                TextFont { font_size: 24.0, ..default() },
+                TextColor(Color::srgb(0.92, 0.94, 0.97)),
+            ));
+        });
+}
+
+/// 联机子屏的根容器（竖排居中 + MpUi 标记）。
+fn mp_root(commands: &mut Commands) -> Entity {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(18.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.08, 0.09, 0.12)),
+            MpUi,
+        ))
+        .id()
+}
+
+fn title(parent: &mut ChildBuilder, text: &str) {
+    parent.spawn((
+        Text::new(text.to_string()),
+        TextFont { font_size: 40.0, ..default() },
+        TextColor(Color::srgb(0.95, 0.85, 0.55)),
+    ));
+}
+
+fn mp_label(parent: &mut ChildBuilder, kind: MpText, size: f32) {
+    parent.spawn((
+        Text::new(""),
+        TextFont { font_size: size, ..default() },
+        TextColor(Color::srgb(0.88, 0.90, 0.94)),
+        kind,
+    ));
+}
+
+fn enter_name_entry(mut commands: Commands) {
+    let root = mp_root(&mut commands);
+    commands.entity(root).with_children(|root| {
+        title(root, "联机 · 输入名字");
+        mp_label(root, MpText::NameInput, 30.0);
+        mp_button(root, MpButton::Confirm, "确定");
+        mp_label(root, MpText::Status, 20.0);
+        root.spawn((
+            Text::new("打字输入名字，[退格]删除，[Esc]返回主菜单"),
+            TextFont { font_size: 18.0, ..default() },
+            TextColor(Color::srgb(0.55, 0.58, 0.65)),
+        ));
+    });
+}
+
+fn enter_mp_menu(mut commands: Commands) {
+    let root = mp_root(&mut commands);
+    commands.entity(root).with_children(|root| {
+        title(root, "大厅");
+        root.spawn((
+            Text::new("创建房间 · 选人数（人不够，房主开局时自动补 AI）:"),
+            TextFont { font_size: 20.0, ..default() },
+            TextColor(Color::srgb(0.82, 0.84, 0.88)),
+        ));
+        root.spawn(Node { flex_direction: FlexDirection::Row, column_gap: Val::Px(14.0), ..default() })
+            .with_children(|row| {
+                for n in 2..=6usize {
+                    mp_num_button(row, n);
+                }
+            });
+        mp_button(root, MpButton::Refresh, "刷新房间列表");
+        mp_label(root, MpText::RoomList, 24.0);
+        mp_label(root, MpText::CodeInput, 28.0);
+        mp_button(root, MpButton::Join, "加入");
+        mp_label(root, MpText::Status, 20.0);
+        root.spawn((
+            Text::new("打字输入房间号，[Esc]返回主菜单"),
+            TextFont { font_size: 18.0, ..default() },
+            TextColor(Color::srgb(0.55, 0.58, 0.65)),
+        ));
+    });
+}
+
+/// 选人数建房的方块按钮（点一下就建对应人数的房间）。
+fn mp_num_button(parent: &mut ChildBuilder, n: usize) {
+    parent
+        .spawn((
+            Button,
+            MpButton::Create(n),
+            Node {
+                width: Val::Px(84.0),
+                height: Val::Px(64.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor(Color::srgb(0.45, 0.48, 0.58)),
+            BackgroundColor(BTN_NORMAL),
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(format!("{n}")),
+                TextFont { font_size: 34.0, ..default() },
+                TextColor(Color::srgb(0.92, 0.94, 0.97)),
+            ));
+        });
+}
+
+fn enter_lobby(mut commands: Commands) {
+    let root = mp_root(&mut commands);
+    commands.entity(root).with_children(|root| {
+        title(root, "房间");
+        mp_label(root, MpText::Lobby, 26.0);
+        root.spawn(Node { flex_direction: FlexDirection::Row, column_gap: Val::Px(20.0), ..default() })
+            .with_children(|row| {
+                mp_button(row, MpButton::Start, "开始(房主)");
+                mp_button(row, MpButton::Leave, "离开");
+            });
+        mp_label(root, MpText::Status, 20.0);
+    });
+}
+
+fn cleanup_mp(mut commands: Commands, q: Query<Entity, With<MpUi>>) {
+    for e in &q {
+        commands.entity(e).despawn_recursive();
+    }
+}
+
+// ============================ 设置（占位）============================
 
 fn enter_settings(mut commands: Commands) {
     spawn_info_screen(&mut commands, "Settings", "设置项待定（音量、分辨率、按键等）。");
@@ -1225,7 +1636,7 @@ fn showdown_director(
 
     // 无需点选（已弃牌/无人类）→ 自动选最优并结算。
     if !session.mtch.settled {
-        session.mtch.settle_hand(None);
+        session.mtch.settle_hand(&[]);
     }
     spawn_result_panel(&mut commands, &session.mtch);
 }
@@ -1462,7 +1873,13 @@ fn confirm_selection(
     for interaction in &q {
         if *interaction == Interaction::Pressed {
             let picks = [sel.picks[0], sel.picks[1], sel.picks[2]];
-            session.mtch.settle_hand(Some(picks));
+            // 单机人类是唯一非 AI 座位。
+            let human = session.mtch.seats.iter().find(|s| !s.is_ai).map(|s| s.id);
+            if let Some(id) = human {
+                session.mtch.settle_hand(&[(id, picks)]);
+            } else {
+                session.mtch.settle_hand(&[]);
+            }
             commands.remove_resource::<Selection>();
             for e in &select_ui {
                 commands.entity(e).despawn_recursive();
