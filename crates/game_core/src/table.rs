@@ -171,13 +171,18 @@ impl Match {
         }
         let s = self.hand.settle_with(picks);
 
-        // 底池入账：有赢家发给赢家，否则滚存到下一手。
-        if let Some(winner_id) = s.winner {
-            if let Some(p) = self.hand.players.iter_mut().find(|p| p.id == winner_id) {
-                p.chips += self.hand.pot;
-            }
-        } else {
+        // 底池入账：无人通关滚存；独赢全拿；并列均分（余数给第一位，保证筹码守恒）。
+        if s.winners.is_empty() {
             self.carry += self.hand.pot;
+        } else {
+            let n = s.winners.len() as u32;
+            let share = self.hand.pot / n;
+            let remainder = self.hand.pot % n;
+            for (k, &wid) in s.winners.iter().enumerate() {
+                if let Some(p) = self.hand.players.iter_mut().find(|p| p.id == wid) {
+                    p.chips += share + if k == 0 { remainder } else { 0 };
+                }
+            }
         }
 
         // 把本手结束的筹码写回座位。
@@ -280,11 +285,11 @@ mod tests {
         let total_after: u32 = m.seats.iter().map(|x| x.chips).sum();
         // 二次结算应返回相同结果且不再二次发钱。
         let s2 = m.settle_hand(&[]);
-        assert_eq!(s1.winner, s2.winner);
+        assert_eq!(s1.winners, s2.winners);
         let total_again: u32 = m.seats.iter().map(|x| x.chips).sum();
         assert_eq!(total_after, total_again);
         // 有赢家时底池进了某人筹码；无赢家时滚存。
-        if s1.winner.is_some() {
+        if !s1.winners.is_empty() {
             assert!(pot > 0);
         } else {
             assert_eq!(m.carry, pot);
@@ -324,7 +329,7 @@ mod tests {
                 }
                 let s = m.settle_hand(&[]);
                 hands += 1;
-                if s.winner.is_some() {
+                if !s.winners.is_empty() {
                     cleared += 1;
                 }
                 m.next_hand();
@@ -356,5 +361,32 @@ mod tests {
         assert_eq!(m.hand.phase, Phase::PreFlop);
         // 重新发了牌（极大概率与上一手不同）。
         let _ = hole0;
+    }
+
+    /// 联机：多个人类各自提交手选，settle_hand 应分别采用各自的选择。
+    #[test]
+    fn settle_hand_accepts_multiple_human_picks() {
+        let mut m = Match::new(
+            vec![SeatDef::new("A", false), SeatDef::new("B", false), SeatDef::new("C", true)],
+            7,
+        );
+        // 推进到摊牌。
+        let mut guard = 0;
+        while !m.hand_over() && guard < 300 {
+            let idx = m.hand.to_act;
+            m.hand.apply(crate::ai::decide(&m.hand, idx)).unwrap();
+            guard += 1;
+        }
+        assert!(m.hand_over());
+        // 给仍在局的两个「人类」座位各提交一组手选（取前 3 张公共牌）。
+        let mut picks = Vec::new();
+        for i in 0..m.seats.len() {
+            if !m.seats[i].is_ai && m.hand.players[i].is_in_hand() {
+                picks.push((m.hand.players[i].id, [0usize, 1, 2]));
+            }
+        }
+        let s = m.settle_hand(&picks);
+        // 结算正常产出（每个在局玩家一条结果）。
+        assert_eq!(s.results.len(), m.hand.players.iter().filter(|p| p.is_in_hand()).count());
     }
 }

@@ -18,7 +18,9 @@ use bevy_renet::netcode::{ClientAuthentication, NetcodeClientPlugin, NetcodeClie
 use bevy_renet::renet::{ConnectionConfig, DefaultChannel, RenetClient};
 use bevy_renet::RenetClientPlugin;
 use game_core::{Action, Match, Phase, SeatDef};
-use riverborn_net::{ClientMsg, PlayerId, RoomInfo, RoomState, ServerMsg, DEFAULT_PORT, PROTOCOL_ID};
+use riverborn_net::{
+    CardView, ClientMsg, GameView, PlayerId, RoomInfo, RoomState, ServerMsg, DEFAULT_PORT, PROTOCOL_ID,
+};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{SystemTime, UNIX_EPOCH};
 use winit::window::Icon;
@@ -54,6 +56,7 @@ enum MpState {
     NameEntry,
     Menu,
     Lobby,
+    InGame,
 }
 
 // ============================ 资源 ============================
@@ -110,11 +113,16 @@ struct Net {
     rooms: Vec<RoomInfo>, // 搜索到的房间
     room: Option<RoomState>, // 当前所在房间
     status: String,       // 提示 / 错误
+    view: Option<GameView>, // 对局中：服务器下发的最新视图
 }
 
 /// 联机各子屏的根标记（OnExit 清理）。
 #[derive(Component)]
 struct MpUi;
+
+/// 联机的 BGM 实体（大厅曲 / 对局曲切换时用它定位旧曲）。
+#[derive(Component)]
+struct MpMusic;
 
 /// 联机界面按钮。
 #[derive(Component)]
@@ -299,8 +307,6 @@ fn main() {
             Update,
             (
                 showdown_director,
-                selection_clicks,
-                selection_ui_update,
                 confirm_selection,
                 result_buttons,
                 borrow_button,
@@ -309,6 +315,11 @@ fn main() {
                 sync_scene_bg,
             )
                 .run_if(in_state(AppState::SinglePlayer)),
+        )
+        // 点选公共牌的高亮/计数：单机和联机共用，只要 Selection 资源在就跑
+        .add_systems(
+            Update,
+            (selection_clicks, selection_ui_update).run_if(resource_exists::<Selection>),
         )
         // 单人内的暂停切换 + 暂停菜单
         .add_systems(Update, pause_input.run_if(in_state(AppState::SinglePlayer)))
@@ -331,6 +342,14 @@ fn main() {
         .add_systems(OnExit(MpState::NameEntry), cleanup_mp)
         .add_systems(OnExit(MpState::Menu), cleanup_mp)
         .add_systems(OnExit(MpState::Lobby), cleanup_mp)
+        // 联机对局
+        .add_systems(OnEnter(MpState::InGame), enter_mp_game)
+        .add_systems(OnExit(MpState::InGame), cleanup)
+        .add_systems(
+            Update,
+            (mp_game_refresh, mp_game_overlays, mp_game_input, mp_game_buttons, mp_confirm, mp_deal_sfx)
+                .run_if(in_state(MpState::InGame)),
+        )
         // 设置（占位）
         .add_systems(OnEnter(AppState::Settings), enter_settings)
         // 多人/设置顶层页面按 Esc 返回主菜单（单人的 Esc 交给 pause_input）
@@ -588,7 +607,8 @@ fn avatar_file(seat: usize) -> String {
 }
 
 /// 按人数返回各座位的左上角坐标（数量恰好等于人数，无空座）。
-/// 3：上 + 左下 + 右下；4：上下左右；5：上 + 两侧 + 左下右下；6：上下 + 四角。
+/// 2：上 + 下；3：上 + 左下 + 右下；4：上下左右；5：上 + 两侧 + 左下右下；6：上下 + 四角。
+/// 联机最少 2 人——之前缺 2 人分支会落到 6 人兜底，多铺 4 个空座位（已修）。
 fn seat_positions(count: usize) -> Vec<(f32, f32)> {
     const TOP: (f32, f32) = (1000.0, 28.0);
     const BOTTOM: (f32, f32) = (1000.0, 840.0);
@@ -599,10 +619,13 @@ fn seat_positions(count: usize) -> Vec<(f32, f32)> {
     const BOTTOM_LEFT: (f32, f32) = (24.0, 700.0);
     const BOTTOM_RIGHT: (f32, f32) = (1700.0, 700.0);
     match count {
+        0 => vec![],
+        1 => vec![TOP],
+        2 => vec![TOP, BOTTOM],
         3 => vec![TOP, BOTTOM_LEFT, BOTTOM_RIGHT],
         4 => vec![TOP, BOTTOM, MID_LEFT, MID_RIGHT],
         5 => vec![TOP, MID_LEFT, MID_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT],
-        _ => vec![TOP, BOTTOM, TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT], // 6（也兜底）
+        _ => vec![TOP, BOTTOM, TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT], // 6（也兜底 >6）
     }
 }
 
@@ -1069,7 +1092,13 @@ fn server_addr() -> SocketAddr {
 }
 
 /// 进入联机：建立到服务器的连接，初始化会话状态。
-fn mp_connect(mut commands: Commands) {
+fn mp_connect(mut commands: Commands, assets: Res<AssetServer>) {
+    // 大厅 BGM（循环），离开联机时由 cleanup 停掉。
+    commands.spawn((
+        AudioPlayer::new(assets.load("audio/Main_menu_music.mp3")),
+        PlaybackSettings::LOOP,
+        MpMusic,
+    ));
     let server = server_addr();
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -1121,6 +1150,7 @@ fn mp_send_hello(client: Option<ResMut<RenetClient>>, net: Option<ResMut<Net>>) 
 fn mp_receive(
     client: Option<ResMut<RenetClient>>,
     net: Option<ResMut<Net>>,
+    state: Res<State<MpState>>,
     mut mp_next: ResMut<NextState<MpState>>,
 ) {
     let (Some(mut client), Some(mut net)) = (client, net) else { return };
@@ -1140,7 +1170,18 @@ fn mp_receive(
                 mp_next.set(MpState::Menu);
             }
             ServerMsg::Error { text } => net.status = format!("⚠ {text}"),
-            ServerMsg::GameStarting => net.status = "游戏即将开始（对局功能在阶段 2）".into(),
+            ServerMsg::GameStarting => net.status = "发牌中…".into(),
+            ServerMsg::View { view } => {
+                net.view = Some(view);
+                // 收到第一份对局视图就切到牌桌。
+                if *state.get() != MpState::InGame {
+                    mp_next.set(MpState::InGame);
+                }
+            }
+            ServerMsg::GameEnded => {
+                net.view = None;
+                mp_next.set(MpState::Lobby);
+            }
         }
     }
 }
@@ -1385,7 +1426,15 @@ fn mp_num_button(parent: &mut ChildBuilder, n: usize) {
         });
 }
 
-fn enter_lobby(mut commands: Commands) {
+fn enter_lobby(mut commands: Commands, assets: Res<AssetServer>, music: Query<(), With<MpMusic>>) {
+    // 从对局返回大厅时（对局 BGM 已被清理），重新放大厅 BGM。
+    if music.is_empty() {
+        commands.spawn((
+            AudioPlayer::new(assets.load("audio/Main_menu_music.mp3")),
+            PlaybackSettings::LOOP,
+            MpMusic,
+        ));
+    }
     let root = mp_root(&mut commands);
     commands.entity(root).with_children(|root| {
         title(root, "房间");
@@ -1403,6 +1452,457 @@ fn cleanup_mp(mut commands: Commands, q: Query<Entity, With<MpUi>>) {
     for e in &q {
         commands.entity(e).despawn_recursive();
     }
+}
+
+// ===================== 联机对局（阶段 2）：从 GameView 渲染牌桌 =====================
+
+/// 联机牌桌头像：你自己用 player.png，其余按座位循环用 AI 立绘。
+fn mp_avatar_file(seat: usize, you_seat: usize) -> String {
+    if seat == you_seat {
+        "avatars/player.png".to_string()
+    } else {
+        format!("avatars/{}.png", AI_AVATARS[seat % AI_AVATARS.len()])
+    }
+}
+
+/// 进入对局：按视图里的人数铺牌桌（复用单机的牌槽 Slot + spawn 助手）。
+fn enter_mp_game(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    audio: Res<AudioAssets>,
+    net: Option<Res<Net>>,
+    music: Query<Entity, With<MpMusic>>,
+) {
+    let Some(net) = net else { return };
+    let Some(view) = &net.view else { return };
+    let count = view.seats.len();
+    let you = view.you_seat.unwrap_or(0);
+
+    commands.remove_resource::<Selection>();
+    commands.insert_resource(RevealCount(0));
+
+    // 把大厅 BGM 换成对局 BGM，并放一次发牌音效。
+    for e in &music {
+        commands.entity(e).despawn_recursive();
+    }
+    commands.spawn((AudioPlayer::new(audio.game_bgm.clone()), PlaybackSettings::LOOP, MpMusic));
+    commands.spawn((AudioPlayer::new(audio.shuffle.clone()), PlaybackSettings::DESPAWN));
+
+    // 背景（按场景）。
+    commands.spawn((
+        ImageNode::new(assets.load(format!("table/{}.png", view.scene_art))),
+        Node { position_type: PositionType::Absolute, width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() },
+        GlobalZIndex(-1),
+        SceneBackground,
+    ));
+    // 卡背。
+    let card_back: Handle<Image> = assets.load(format!("cards/{}.png", pick(&CARD_BACKS)));
+    commands.insert_resource(CardBack(card_back.clone()));
+
+    // 状态栏。
+    commands.spawn((
+        Text::new(""),
+        TextFont { font_size: 22.0, ..default() },
+        TextColor(Color::srgb(0.95, 0.96, 0.98)),
+        Node { position_type: PositionType::Absolute, top: Val::Px(12.0), left: Val::Px(16.0), max_width: Val::Px(360.0), ..default() },
+        Slot::Status,
+    ));
+
+    // 公共池 5 张（可点选）。
+    for i in 0..5 {
+        let x = COMMUNITY_POOL_X + i as f32 * (COMMUNITY_CARD_W + COMMUNITY_CARD_GAP);
+        let e = spawn_card(&mut commands, x, COMMUNITY_POOL_Y, COMMUNITY_CARD_W, COMMUNITY_CARD_H, COL_GOLD, card_back.clone(), Slot::Community(i));
+        commands.entity(e).insert((Button, Interaction::default(), Selectable(i)));
+        spawn_value_label(&mut commands, x, COMMUNITY_POOL_Y, COMMUNITY_CARD_W, COMMUNITY_CARD_H, Slot::Community(i));
+    }
+    spawn_label(&mut commands, COMMUNITY_POOL_X, COMMUNITY_POOL_Y - 28.0, "Community Pool");
+
+    // 地牢 3 个。
+    for i in 0..3 {
+        let x = DUNGEON_POOL_X + i as f32 * (DUNGEON_CARD_W + DUNGEON_CARD_GAP);
+        spawn_card(&mut commands, x, DUNGEON_POOL_Y, DUNGEON_CARD_W, DUNGEON_CARD_H, COL_RED, card_back.clone(), Slot::Dungeon(i));
+        spawn_value_label(&mut commands, x, DUNGEON_POOL_Y, DUNGEON_CARD_W, DUNGEON_CARD_H, Slot::Dungeon(i));
+    }
+    spawn_label(&mut commands, DUNGEON_POOL_X, DUNGEON_POOL_Y - 28.0, "Dungeon / Boss");
+
+    // 座位。
+    for (seat, (x, y)) in seat_positions(count).iter().enumerate() {
+        spawn_avatar(&mut commands, *x, *y, assets.load(mp_avatar_file(seat, you)));
+        spawn_seat_name(&mut commands, x + SEAT_TEXT_X_OFFSET, *y, seat);
+        let x1 = x + HOLE_CARD_W + HOLE_CARD_GAP;
+        let cy = y + HOLE_CARD_TOP_OFFSET;
+        spawn_card(&mut commands, *x, cy, HOLE_CARD_W, HOLE_CARD_H, COL_HOLE, card_back.clone(), Slot::Hole { seat, idx: 0 });
+        spawn_value_label(&mut commands, *x, cy, HOLE_CARD_W, HOLE_CARD_H, Slot::Hole { seat, idx: 0 });
+        spawn_card(&mut commands, x1, cy, HOLE_CARD_W, HOLE_CARD_H, COL_HOLE, card_back.clone(), Slot::Hole { seat, idx: 1 });
+        spawn_value_label(&mut commands, x1, cy, HOLE_CARD_W, HOLE_CARD_H, Slot::Hole { seat, idx: 1 });
+    }
+
+    // 借一锅按钮（默认隐藏，refresh 按 view.low_chips 显隐）。
+    commands.spawn((
+        Button,
+        BorrowButton,
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(24.0),
+            top: Val::Px(980.0),
+            width: Val::Px(240.0),
+            height: Val::Px(56.0),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            border: UiRect::all(Val::Px(2.0)),
+            display: Display::None,
+            ..default()
+        },
+        BorderColor(Color::srgb(0.85, 0.72, 0.35)),
+        BackgroundColor(Color::srgb(0.20, 0.16, 0.10)),
+        GlobalZIndex(40),
+    ))
+    .with_children(|b| {
+        b.spawn((
+            Text::new("借一锅 (+1000)"),
+            TextFont { font_size: 24.0, ..default() },
+            TextColor(Color::srgb(0.95, 0.85, 0.55)),
+        ));
+    });
+}
+
+/// 用最新视图刷新所有牌槽 + 借锅按钮显隐 + 背景。
+fn mp_game_refresh(
+    net: Option<Res<Net>>,
+    back: Res<CardBack>,
+    assets: Res<AssetServer>,
+    selection: Option<Res<Selection>>,
+    mut q: Query<(Option<&mut Text>, Option<&mut ImageNode>, Option<&mut BorderColor>, &Slot)>,
+    mut bg_q: Query<&mut ImageNode, (With<SceneBackground>, Without<Slot>)>,
+    mut borrow_q: Query<&mut Node, With<BorrowButton>>,
+) {
+    let Some(net) = net else { return };
+    let Some(view) = &net.view else { return };
+    let selecting = selection.is_some();
+    let you = view.you_seat;
+
+    for mut img in &mut bg_q {
+        img.image = assets.load(format!("table/{}.png", view.scene_art));
+    }
+    for mut node in &mut borrow_q {
+        node.display = if view.low_chips { Display::Flex } else { Display::None };
+    }
+
+    for (text, image, border, slot) in &mut q {
+        match slot {
+            Slot::Status => set_text(text, mp_status_text(view)),
+            Slot::SeatName(seat) => set_text(text, mp_seat_text(view, *seat)),
+            Slot::Community(i) => {
+                let (handle, col, val) = match view.community.get(*i) {
+                    Some(c) => (assets.load(format!("cards/community/{}.png", c.art)), COL_GOLD, c.label.clone()),
+                    None => (back.0.clone(), COL_DIM, String::new()),
+                };
+                set_image(image, handle);
+                if !selecting {
+                    set_border(border, col);
+                }
+                set_text(text, val);
+            }
+            Slot::Dungeon(i) => {
+                let (handle, col, val) = match view.dungeon.get(*i) {
+                    Some(c) => (assets.load(format!("cards/dungeon/{}.png", c.art)), COL_RED, c.label.clone()),
+                    None => (back.0.clone(), COL_DIM, String::new()),
+                };
+                set_image(image, handle);
+                set_border(border, col);
+                set_text(text, val);
+            }
+            Slot::Hole { seat, idx } => {
+                let seat = *seat;
+                let idx = *idx;
+                // 自己的底牌总亮；其余仅摊牌时亮（revealed_holes）。
+                let card: Option<&CardView> = if Some(seat) == you {
+                    view.your_hole.as_ref().map(|h| &h[idx])
+                } else {
+                    view.revealed_holes.get(seat).and_then(|o| o.as_ref()).map(|h| &h[idx])
+                };
+                let (handle, val) = match card {
+                    Some(c) => (assets.load(format!("cards/community/{}.png", c.art)), c.label.clone()),
+                    None => (back.0.clone(), String::new()),
+                };
+                let is_turn = view.seats.get(seat).map(|s| s.is_turn).unwrap_or(false);
+                let col = if is_turn { COL_ACTIVE } else { COL_HOLE };
+                set_image(image, handle);
+                set_border(border, col);
+                set_text(text, val);
+            }
+        }
+    }
+}
+
+fn mp_status_text(view: &GameView) -> String {
+    let berserk = if view.boss_berserk { "  狂暴!" } else { "" };
+    let mut s = format!(
+        "联机 · 第 {} 手\n{}\nPot: {}   Bet: {}\n惊动 {:.1}{}\nP=战力 H=生命 T=威胁\n",
+        view.hand_no + 1, view.scene_label, view.pot, view.current_bet, view.aggro, berserk,
+    );
+    match view.to_act_seat {
+        Some(seat) => {
+            let actor = view.seats.get(seat).map(|s| s.name.as_str()).unwrap_or("-");
+            let yours = view.you_seat == Some(seat);
+            if yours {
+                s.push_str("轮到你：[Q]过 [W]跟 [E]加20 [R]弃 [T]全下");
+            } else {
+                s.push_str(&format!("等待 {actor} 行动…"));
+            }
+        }
+        None => s.push_str("=== 摊牌结算 ==="),
+    }
+    s
+}
+
+fn mp_seat_text(view: &GameView, seat: usize) -> String {
+    match view.seats.get(seat) {
+        Some(s) => {
+            let here = if s.is_turn { " *" } else { "" };
+            let me = if view.you_seat == Some(seat) { " (你)" } else if s.is_ai { " (AI)" } else { "" };
+            let debt = if s.debt > 0 { format!("\nDebt {}", s.debt) } else { String::new() };
+            format!("{}{}{}\nChips {}\nin {} | {:?}{}", s.name, me, here, s.chips, s.committed, s.status, debt)
+        }
+        None => String::new(),
+    }
+}
+
+/// 翻牌时（公共牌/地牢揭示数增加）放一次发牌音效。
+fn mp_deal_sfx(
+    mut commands: Commands,
+    audio: Res<AudioAssets>,
+    net: Option<Res<Net>>,
+    reveal: Option<ResMut<RevealCount>>,
+) {
+    let (Some(net), Some(mut reveal)) = (net, reveal) else { return };
+    let Some(view) = &net.view else { return };
+    let revealed = view.community.len() + view.dungeon.len();
+    if revealed > reveal.0 {
+        commands.spawn((AudioPlayer::new(audio.shuffle.clone()), PlaybackSettings::DESPAWN));
+    }
+    reveal.0 = revealed;
+}
+
+/// 键盘下注：仅轮到自己时把动作发给服务器。
+fn mp_game_input(keys: Res<ButtonInput<KeyCode>>, client: Option<ResMut<RenetClient>>, net: Option<Res<Net>>) {
+    let (Some(mut client), Some(net)) = (client, net) else { return };
+    let Some(view) = &net.view else { return };
+    if view.to_act_seat.is_none() || view.to_act_seat != view.you_seat {
+        return;
+    }
+    let bet = view.current_bet;
+    let action = if keys.just_pressed(KeyCode::KeyQ) {
+        Action::Check
+    } else if keys.just_pressed(KeyCode::KeyW) {
+        Action::Call
+    } else if keys.just_pressed(KeyCode::KeyE) {
+        Action::Raise { to: bet + 20 }
+    } else if keys.just_pressed(KeyCode::KeyR) {
+        Action::Fold
+    } else if keys.just_pressed(KeyCode::KeyT) {
+        Action::AllIn
+    } else {
+        return;
+    };
+    client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::Act { action }.encode());
+}
+
+/// 联机牌桌按钮：借一锅 / 下一手。
+fn mp_game_buttons(
+    client: Option<ResMut<RenetClient>>,
+    mut borrow_q: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<BorrowButton>)>,
+    mut next_q: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<NextHandButton>, Without<BorrowButton>)>,
+) {
+    let Some(mut client) = client else { return };
+    for (interaction, mut bg) in &mut borrow_q {
+        match interaction {
+            Interaction::Pressed => {
+                client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::Borrow.encode());
+                bg.0 = Color::srgb(0.32, 0.25, 0.14);
+            }
+            Interaction::Hovered => bg.0 = Color::srgb(0.26, 0.21, 0.13),
+            Interaction::None => bg.0 = Color::srgb(0.20, 0.16, 0.10),
+        }
+    }
+    for (interaction, mut bg) in &mut next_q {
+        match interaction {
+            Interaction::Pressed => {
+                client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::NextHand.encode());
+            }
+            Interaction::Hovered => bg.0 = BTN_HOVER,
+            Interaction::None => bg.0 = BTN_NORMAL,
+        }
+    }
+}
+
+/// 确认手选 → 发给服务器（联机版；不在本地结算）。
+fn mp_confirm(
+    client: Option<ResMut<RenetClient>>,
+    selection: Option<Res<Selection>>,
+    q: Query<&Interaction, (Changed<Interaction>, With<ConfirmButton>)>,
+) {
+    let (Some(mut client), Some(sel)) = (client, selection) else { return };
+    if sel.picks.len() != 3 {
+        return;
+    }
+    for interaction in &q {
+        if *interaction == Interaction::Pressed {
+            let picks = [sel.picks[0], sel.picks[1], sel.picks[2]];
+            client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::SelectCards { picks }.encode());
+        }
+    }
+}
+
+/// 管理对局 overlay：结算面板 + 点选 UI 的出现/消失（据视图）。
+fn mp_game_overlays(
+    mut commands: Commands,
+    net: Option<Res<Net>>,
+    selection: Option<Res<Selection>>,
+    result_ui: Query<Entity, With<ResultUi>>,
+    select_ui: Query<Entity, With<SelectUi>>,
+) {
+    let Some(net) = net else { return };
+    let Some(view) = &net.view else { return };
+
+    let has_result = view.result.is_some();
+    if has_result && result_ui.is_empty() {
+        mp_spawn_result_panel(&mut commands, view);
+    } else if !has_result && !result_ui.is_empty() {
+        for e in &result_ui {
+            commands.entity(e).despawn_recursive();
+        }
+    }
+
+    if view.need_select && selection.is_none() {
+        commands.insert_resource(Selection::default());
+        spawn_select_ui(&mut commands);
+    } else if !view.need_select && selection.is_some() {
+        commands.remove_resource::<Selection>();
+        for e in &select_ui {
+            commands.entity(e).despawn_recursive();
+        }
+    }
+}
+
+/// 赢家文字：空=无人通关(滚存)；1 个=独赢；多个=战后优势值并列均分。
+fn winners_line(winners: &[game_core::PlayerId], pot: u32, name_of: impl Fn(game_core::PlayerId) -> String) -> String {
+    match winners.len() {
+        0 => format!("无人通关，底池 {pot} 滚入下一手"),
+        1 => format!("赢家：{}    底池 {pot}", name_of(winners[0])),
+        n => {
+            let names: Vec<String> = winners.iter().map(|&id| name_of(id)).collect();
+            format!("平局均分：{}    底池 {pot} ÷ {n} = {}/人", names.join("、"), pot / n as u32)
+        }
+    }
+}
+
+/// 联机结算计分板（从 GameView 构建；只有房主显示「下一手」）。
+fn mp_spawn_result_panel(commands: &mut Commands, view: &GameView) {
+    let Some(settle) = &view.result else { return };
+    let total_t: u32 = view.dungeon_threats.iter().sum();
+    let total_h: u32 = 0; // 节点生命已在牌面显示，这里只汇总威胁
+    let _ = total_h;
+    let mut dungeon_line = format!("地牢威胁合计 {}   惊动 {:.1}", total_t, view.aggro);
+    if view.boss_berserk {
+        dungeon_line.push_str("  狂暴!");
+    }
+
+    let name_of = |id: game_core::PlayerId| view.seats.get(id.0 as usize).map(|s| s.name.clone()).unwrap_or_else(|| "?".into());
+    let mut board = String::new();
+    for r in &settle.results {
+        let nm = name_of(r.id);
+        if r.cleared {
+            board.push_str(&format!(
+                "{:<11} 队伍 P{:<3} H{:<3} →  通关  余血{} 战力{}  优势 {}\n",
+                nm, r.team_power, r.team_health, r.remaining_health, r.remaining_power, r.advantage
+            ));
+        } else {
+            board.push_str(&format!("{:<11} 队伍 P{:<3} H{:<3} →  团灭\n", nm, r.team_power, r.team_health));
+        }
+    }
+    let winner_line = winners_line(&settle.winners, view.pot, name_of);
+    let can_next = view.can_next;
+
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            GlobalZIndex(50),
+            ResultUi,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(14.0),
+                    padding: UiRect::all(Val::Px(28.0)),
+                    border: UiRect::all(Val::Px(2.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.04, 0.05, 0.08, 0.92)),
+                BorderColor(Color::srgb(0.55, 0.50, 0.35)),
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new(format!("本手结算 · {}", view.scene_label)),
+                    TextFont { font_size: 38.0, ..default() },
+                    TextColor(Color::srgb(0.95, 0.85, 0.55)),
+                ));
+                panel.spawn((
+                    Text::new(dungeon_line),
+                    TextFont { font_size: 22.0, ..default() },
+                    TextColor(Color::srgb(0.88, 0.55, 0.50)),
+                ));
+                panel.spawn((
+                    Text::new(board),
+                    TextFont { font_size: 23.0, ..default() },
+                    TextColor(Color::srgb(0.88, 0.90, 0.94)),
+                    Node { margin: UiRect::vertical(Val::Px(6.0)), ..default() },
+                ));
+                panel.spawn((
+                    Text::new(winner_line),
+                    TextFont { font_size: 26.0, ..default() },
+                    TextColor(Color::srgb(0.95, 0.85, 0.55)),
+                ));
+                if can_next {
+                    panel
+                        .spawn((
+                            Button,
+                            NextHandButton,
+                            Node {
+                                width: Val::Px(280.0),
+                                height: Val::Px(60.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(2.0)),
+                                ..default()
+                            },
+                            BorderColor(Color::srgb(0.45, 0.48, 0.58)),
+                            BackgroundColor(BTN_NORMAL),
+                        ))
+                        .with_children(|b| {
+                            b.spawn((
+                                Text::new("下一手"),
+                                TextFont { font_size: 26.0, ..default() },
+                                TextColor(Color::srgb(0.92, 0.94, 0.97)),
+                            ));
+                        });
+                } else {
+                    panel.spawn((
+                        Text::new("等待房主开始下一手…"),
+                        TextFont { font_size: 20.0, ..default() },
+                        TextColor(Color::srgb(0.6, 0.63, 0.7)),
+                    ));
+                }
+            });
+        });
 }
 
 // ============================ 设置（占位）============================
@@ -1740,13 +2240,10 @@ fn spawn_result_panel(commands: &mut Commands, m: &Match) {
         }
     }
 
-    let winner_line = match settle.winner {
-        Some(id) => {
-            let name = m.seats.iter().find(|s| s.id == id).map(|s| s.name.as_str()).unwrap_or("?");
-            format!("赢家：{}    底池 {}", name, g.pot)
-        }
-        None => format!("无人通关，底池 {} 滚入下一手", g.pot),
+    let name_of = |id: game_core::PlayerId| {
+        m.seats.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_else(|| "?".into())
     };
+    let winner_line = winners_line(&settle.winners, g.pot, name_of);
 
     // 外层铺满整窗但**透明**，只负责居中；这样四周座位亮出的底牌仍然可见。
     // 计分板内容收在中间一个半透明框里。

@@ -375,16 +375,16 @@ impl Game {
             });
         }
 
-        // 通关者中**战后优势值**最高者拿主池；无人通关则主池滚入下一局 jackpot。
-        let winner = results
-            .iter()
-            .filter(|r| r.cleared)
-            .max_by_key(|r| r.advantage)
-            .map(|r| r.id);
+        // 通关者中**战后优势值**最高者拿主池；并列最高则均分；无人通关滚入下一局。
+        let best = results.iter().filter(|r| r.cleared).map(|r| r.advantage).max();
+        let winners: Vec<PlayerId> = match best {
+            Some(top) => results.iter().filter(|r| r.cleared && r.advantage == top).map(|r| r.id).collect(),
+            None => Vec::new(),
+        };
 
         Settlement {
             pot: self.pot,
-            winner,
+            winners,
             results,
         }
     }
@@ -445,8 +445,8 @@ pub struct PlayerResult {
 #[derive(Debug, Clone)]
 pub struct Settlement {
     pub pot: u32,
-    /// 主池赢家；None 表示无人通关，主池滚入下一局 jackpot。
-    pub winner: Option<PlayerId>,
+    /// 拿主池的玩家：空=无人通关(滚入下一局)；1 个=独赢；多个=战后优势值并列均分。
+    pub winners: Vec<PlayerId>,
     pub results: Vec<PlayerResult>,
 }
 
@@ -626,6 +626,21 @@ mod tests {
         assert!(o.cleared);
         assert_eq!(o.remaining_health, 7, "用 4/5 张会让余血更高，余血=7 证明只取了 3 张");
         assert_eq!(o.remaining_power, 29);
+    }
+
+    #[test]
+    fn tie_in_advantage_splits_winners() {
+        use Class::*;
+        // 两名玩家底牌完全相同、空地牢必通关 → 战后优势值相同 → 并列均分。
+        let mut g = Game::new(demo_players(2, 200), 10, 1);
+        let hole = [Adventurer::new(Warrior, 5, 10, "Warrior"), Adventurer::new(Mage, 8, 4, "Mage")];
+        g.players[0].hole = hole;
+        g.players[1].hole = hole;
+        g.community = vec![];
+        g.dungeon = vec![];
+        g.scene = Scene::StoneArena;
+        let s = g.settle();
+        assert_eq!(s.winners.len(), 2, "相同优势值应并列为两个赢家");
     }
 
     #[test]
