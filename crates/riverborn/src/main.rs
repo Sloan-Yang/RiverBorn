@@ -283,8 +283,18 @@ fn main() {
         .init_state::<AppState>()
         .add_sub_state::<PauseState>()
         .add_sub_state::<MpState>()
+        .add_event::<BetIntent>()
         .add_systems(Startup, (setup, set_window_icon))
         .add_systems(Update, apply_ui_font)
+        // 下注 HUD（底部 4 按钮 + 加注拉杆 + 特效）：单机/联机共用，全程跑（自身判活）
+        .add_systems(
+            Update,
+            (bet_keys, bet_hud_buttons, bet_slider_drag, bet_hud_update, bet_effects, floaters),
+        )
+        .add_systems(Update, bet_ctx_sp.run_if(in_state(PauseState::Running)))
+        .add_systems(Update, apply_bet_sp.run_if(in_state(PauseState::Running)))
+        .add_systems(Update, bet_ctx_mp.run_if(in_state(MpState::InGame)))
+        .add_systems(Update, send_bet_mp.run_if(in_state(MpState::InGame)))
         // 主菜单
         .add_systems(OnEnter(AppState::MainMenu), enter_main_menu)
         .add_systems(Update, menu_buttons.run_if(in_state(AppState::MainMenu)))
@@ -296,9 +306,7 @@ fn main() {
         .add_systems(OnEnter(AppState::SinglePlayer), enter_single_player)
         .add_systems(
             Update,
-            (ai_auto_play, handle_input, deal_sfx)
-                .chain()
-                .run_if(in_state(PauseState::Running)),
+            (ai_auto_play, deal_sfx).chain().run_if(in_state(PauseState::Running)),
         )
         // 画面刷新单人全程都跑（暂停时也要显示牌桌）
         .add_systems(Update, refresh.run_if(in_state(AppState::SinglePlayer)))
@@ -347,7 +355,7 @@ fn main() {
         .add_systems(OnExit(MpState::InGame), cleanup)
         .add_systems(
             Update,
-            (mp_game_refresh, mp_game_overlays, mp_game_input, mp_game_buttons, mp_confirm, mp_deal_sfx)
+            (mp_game_refresh, mp_game_overlays, mp_game_buttons, mp_confirm, mp_deal_sfx)
                 .run_if(in_state(MpState::InGame)),
         )
         // 设置（占位）
@@ -372,6 +380,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>) {
     commands.spawn(Camera2d);
     commands.insert_resource(UiFont(assets.load("fonts/simhei.ttf")));
     commands.insert_resource(PlayerCount(4)); // 默认 4 人，选人数页面会覆盖
+    commands.insert_resource(Bet::default());
     commands.insert_resource(AudioAssets {
         game_bgm: assets.load("audio/Iron_Stakes.mp3"),
         shuffle: assets.load("audio/shuffle_card.mp3"),
@@ -775,6 +784,7 @@ fn enter_single_player(
 
     // 清掉可能残留的点选状态（上次中途离开单人留下的）。
     commands.remove_resource::<Selection>();
+    spawn_bet_hud(&mut commands);
     commands.insert_resource(RevealCount(0));
     commands.insert_resource(session);
 }
@@ -920,31 +930,6 @@ fn ai_auto_play(time: Res<Time>, mut delay: Local<f32>, mut session: ResMut<Game
     *delay = 0.0;
     let action = game_core::ai::decide(g, idx);
     let _ = g.apply(action);
-}
-
-/// 键盘输入：Q=Check, W=Call, E=Raise+20, R=Fold。仅在轮到人类时生效。
-fn handle_input(keys: Res<ButtonInput<KeyCode>>, mut session: ResMut<GameSession>) {
-    let g = &mut session.mtch.hand;
-    if g.phase == Phase::Showdown || g.phase == Phase::Done {
-        return;
-    }
-    if g.players[g.to_act].is_ai {
-        return;
-    }
-    let action = if keys.just_pressed(KeyCode::KeyQ) {
-        Some(Action::Check)
-    } else if keys.just_pressed(KeyCode::KeyW) {
-        Some(Action::Call)
-    } else if keys.just_pressed(KeyCode::KeyE) {
-        Some(Action::Raise { to: g.current_bet + 20 })
-    } else if keys.just_pressed(KeyCode::KeyR) {
-        Some(Action::Fold)
-    } else {
-        None
-    };
-    if let Some(a) = action {
-        let _ = g.apply(a);
-    }
 }
 
 /// 统一刷新所有槽位（文字槽改字、图片槽换图/换边框色）。
@@ -1564,6 +1549,8 @@ fn enter_mp_game(
             TextColor(Color::srgb(0.95, 0.85, 0.55)),
         ));
     });
+
+    spawn_bet_hud(&mut commands);
 }
 
 /// 用最新视图刷新所有牌槽 + 借锅按钮显隐 + 背景。
@@ -1682,30 +1669,6 @@ fn mp_deal_sfx(
         commands.spawn((AudioPlayer::new(audio.shuffle.clone()), PlaybackSettings::DESPAWN));
     }
     reveal.0 = revealed;
-}
-
-/// 键盘下注：仅轮到自己时把动作发给服务器。
-fn mp_game_input(keys: Res<ButtonInput<KeyCode>>, client: Option<ResMut<RenetClient>>, net: Option<Res<Net>>) {
-    let (Some(mut client), Some(net)) = (client, net) else { return };
-    let Some(view) = &net.view else { return };
-    if view.to_act_seat.is_none() || view.to_act_seat != view.you_seat {
-        return;
-    }
-    let bet = view.current_bet;
-    let action = if keys.just_pressed(KeyCode::KeyQ) {
-        Action::Check
-    } else if keys.just_pressed(KeyCode::KeyW) {
-        Action::Call
-    } else if keys.just_pressed(KeyCode::KeyE) {
-        Action::Raise { to: bet + 20 }
-    } else if keys.just_pressed(KeyCode::KeyR) {
-        Action::Fold
-    } else if keys.just_pressed(KeyCode::KeyT) {
-        Action::AllIn
-    } else {
-        return;
-    };
-    client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::Act { action }.encode());
 }
 
 /// 联机牌桌按钮：借一锅 / 下一手。
@@ -1903,6 +1866,451 @@ fn mp_spawn_result_panel(commands: &mut Commands, view: &GameView) {
                 }
             });
         });
+}
+
+// ====================== 下注 HUD（底部按钮 + 加注拉杆 + 特效）======================
+
+const RAISE_STEP: u32 = 20;
+const SLIDER_W: f32 = 300.0; // 拉杆轨道宽
+const BET_COL_CHECK: Color = Color::srgb(0.24, 0.40, 0.58);
+const BET_COL_CALL: Color = Color::srgb(0.20, 0.52, 0.30);
+const BET_COL_FOLD: Color = Color::srgb(0.58, 0.26, 0.26);
+const BET_COL_RAISE: Color = Color::srgb(0.62, 0.50, 0.22);
+const BET_COL_DISABLED: Color = Color::srgb(0.16, 0.17, 0.21);
+
+/// 四个下注动作（按钮种类 + 特效颜色来源）。
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum BetButton {
+    Check,
+    Call,
+    Fold,
+    Raise,
+}
+
+/// 下注 HUD 根（轮到自己时显示）。
+#[derive(Component)]
+struct BetHud;
+/// 加注拉杆轨道（可点/拖）。
+#[derive(Component)]
+struct RaiseTrack;
+/// 加注拉杆的滑块。
+#[derive(Component)]
+struct RaiseHandle;
+/// 按钮上需要随金额刷新的文字。
+#[derive(Component)]
+struct BetLabel(BetButton);
+/// 飘字特效（上浮 + 淡出后销毁）。
+#[derive(Component)]
+struct Floater {
+    timer: Timer,
+}
+
+/// 下注上下文：从单机 Match 或联机 GameView 每帧填充，HUD/键盘据此判活与算金额。
+#[derive(Resource, Default)]
+struct Bet {
+    active: bool,    // 是否轮到我
+    current_bet: u32,
+    committed: u32,
+    chips: u32,
+    can_check: bool,
+    raise_to: u32,   // 拉杆当前的加注总额（默认 = 最小加注）
+    min_raise: u32,
+    max_raise: u32,  // = committed + chips（拉到顶即全下）
+}
+
+impl Bet {
+    fn need(&self) -> u32 {
+        self.current_bet.saturating_sub(self.committed)
+    }
+    fn can_raise(&self) -> bool {
+        self.max_raise > self.current_bet && self.chips > self.need()
+    }
+    /// 重新计算 min/max 并把 raise_to 夹回区间；turn_start 时重置到最小加注。
+    fn recompute(&mut self, turn_start: bool) {
+        self.max_raise = self.committed + self.chips;
+        self.min_raise = (self.current_bet + RAISE_STEP).min(self.max_raise);
+        if turn_start || self.raise_to < self.min_raise || self.raise_to > self.max_raise {
+            self.raise_to = self.min_raise;
+        }
+    }
+}
+
+fn bet_color(kind: BetButton) -> Color {
+    match kind {
+        BetButton::Check => BET_COL_CHECK,
+        BetButton::Call => BET_COL_CALL,
+        BetButton::Fold => BET_COL_FOLD,
+        BetButton::Raise => BET_COL_RAISE,
+    }
+}
+
+/// 玩家想执行的下注动作（按钮/键盘发，SP 本地执行 / MP 发服务器 / 特效消费）。
+#[derive(Event)]
+struct BetIntent {
+    action: Action,
+    kind: BetButton,
+}
+
+/// 铺底部下注 HUD（默认隐藏；bet_hud_update 按是否轮到自己显隐）。单机和联机都调用。
+fn spawn_bet_hud(commands: &mut Commands) {
+    commands
+        .spawn((
+            BetHud,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(560.0),
+                top: Val::Px(978.0),
+                width: Val::Px(928.0),
+                height: Val::Px(94.0),
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(14.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                display: Display::None,
+                ..default()
+            },
+            GlobalZIndex(45),
+        ))
+        .with_children(|hud| {
+            bet_btn(hud, BetButton::Fold, "弃牌");
+            bet_btn(hud, BetButton::Check, "过牌");
+            bet_btn(hud, BetButton::Call, "跟注");
+            // 加注：拉杆 + 按钮一列。
+            hud.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|col| {
+                // 拉杆轨道（Button 以便接收点击/拖动），内含滑块。
+                col.spawn((
+                    Button,
+                    RaiseTrack,
+                    Node {
+                        width: Val::Px(SLIDER_W),
+                        height: Val::Px(22.0),
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor(Color::srgb(0.5, 0.45, 0.3)),
+                    BackgroundColor(Color::srgb(0.14, 0.13, 0.10)),
+                ))
+                .with_children(|track| {
+                    track.spawn((
+                        RaiseHandle,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: Val::Px(0.0),
+                            top: Val::Px(-5.0),
+                            width: Val::Px(16.0),
+                            height: Val::Px(30.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.95, 0.82, 0.4)),
+                    ));
+                });
+                col.spawn((
+                    Button,
+                    BetButton::Raise,
+                    Node {
+                        width: Val::Px(SLIDER_W),
+                        height: Val::Px(56.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor(Color::srgb(0.45, 0.48, 0.58)),
+                    BackgroundColor(BET_COL_RAISE),
+                ))
+                .with_children(|b| {
+                    b.spawn((
+                        Text::new("加注"),
+                        TextFont { font_size: 24.0, ..default() },
+                        TextColor(Color::srgb(0.96, 0.96, 0.98)),
+                        TextLayout::new_with_justify(JustifyText::Center),
+                        BetLabel(BetButton::Raise),
+                    ));
+                });
+            });
+        });
+}
+
+fn bet_btn(parent: &mut ChildBuilder, kind: BetButton, label: &str) {
+    parent
+        .spawn((
+            Button,
+            kind,
+            Node {
+                width: Val::Px(146.0),
+                height: Val::Px(84.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor(Color::srgb(0.45, 0.48, 0.58)),
+            BackgroundColor(bet_color(kind)),
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(label),
+                TextFont { font_size: 26.0, ..default() },
+                TextColor(Color::srgb(0.96, 0.96, 0.98)),
+                TextLayout::new_with_justify(JustifyText::Center),
+                BetLabel(kind),
+            ));
+        });
+}
+
+/// 单机：从本地 Match 填下注上下文。
+fn bet_ctx_sp(session: Option<Res<GameSession>>, mut bet: ResMut<Bet>) {
+    let Some(session) = session else {
+        bet.active = false;
+        return;
+    };
+    let g = &session.mtch.hand;
+    let was = bet.active;
+    let me_turn = !matches!(g.phase, Phase::Showdown | Phase::Done)
+        && g.players.get(g.to_act).map(|p| !p.is_ai).unwrap_or(false);
+    if !me_turn {
+        bet.active = false;
+        return;
+    }
+    let p = &g.players[g.to_act];
+    bet.active = true;
+    bet.current_bet = g.current_bet;
+    bet.committed = p.committed;
+    bet.chips = p.chips;
+    bet.can_check = p.committed >= g.current_bet;
+    bet.recompute(!was);
+}
+
+/// 联机：从服务器视图填下注上下文。
+fn bet_ctx_mp(net: Option<Res<Net>>, mut bet: ResMut<Bet>) {
+    let Some(net) = net else {
+        bet.active = false;
+        return;
+    };
+    let Some(view) = &net.view else {
+        bet.active = false;
+        return;
+    };
+    let was = bet.active;
+    let me_turn = view.to_act_seat.is_some() && view.to_act_seat == view.you_seat;
+    let seat = view.you_seat.and_then(|i| view.seats.get(i));
+    match (me_turn, seat) {
+        (true, Some(s)) => {
+            bet.active = true;
+            bet.current_bet = view.current_bet;
+            bet.committed = s.committed;
+            bet.chips = s.chips;
+            bet.can_check = s.committed >= view.current_bet;
+            bet.recompute(!was);
+        }
+        _ => bet.active = false,
+    }
+}
+
+/// 显隐 HUD、刷新按钮金额文字、置灰不可用项、摆拉杆滑块。
+fn bet_hud_update(
+    bet: Res<Bet>,
+    mut hud: Query<&mut Node, (With<BetHud>, Without<RaiseHandle>)>,
+    mut handle: Query<&mut Node, (With<RaiseHandle>, Without<BetHud>)>,
+    mut labels: Query<(&mut Text, &BetLabel)>,
+    mut btns: Query<(&BetButton, &mut BackgroundColor)>,
+) {
+    for mut n in &mut hud {
+        n.display = if bet.active { Display::Flex } else { Display::None };
+    }
+    if !bet.active {
+        return;
+    }
+    // 滑块位置。
+    let span = bet.max_raise.saturating_sub(bet.min_raise);
+    let frac = if span > 0 {
+        (bet.raise_to.saturating_sub(bet.min_raise)) as f32 / span as f32
+    } else {
+        0.0
+    };
+    for mut n in &mut handle {
+        n.left = Val::Px(frac * (SLIDER_W - 16.0));
+    }
+    // 按钮文字。
+    for (mut t, lbl) in &mut labels {
+        match lbl.0 {
+            BetButton::Call => t.0 = if bet.need() > 0 { format!("跟注 {}", bet.need()) } else { "跟注".into() },
+            BetButton::Raise => {
+                t.0 = if bet.raise_to >= bet.max_raise {
+                    format!("全下 {}", bet.max_raise)
+                } else {
+                    format!("加注到 {}", bet.raise_to)
+                }
+            }
+            _ => {}
+        }
+    }
+    // 置灰不可用按钮。
+    for (kind, mut bg) in &mut btns {
+        let ok = match kind {
+            BetButton::Check => bet.can_check,
+            BetButton::Call => bet.need() > 0,
+            BetButton::Fold => true,
+            BetButton::Raise => bet.can_raise(),
+        };
+        bg.0 = if ok { bet_color(*kind) } else { BET_COL_DISABLED };
+    }
+}
+
+/// 把一次下注意图转成动作（含「拉满=全下」「不能过牌就忽略」等）。
+fn intent_for(kind: BetButton, bet: &Bet) -> Option<Action> {
+    match kind {
+        BetButton::Check => bet.can_check.then_some(Action::Check),
+        BetButton::Call => Some(Action::Call),
+        BetButton::Fold => Some(Action::Fold),
+        BetButton::Raise => {
+            if !bet.can_raise() {
+                None
+            } else if bet.raise_to >= bet.max_raise {
+                Some(Action::AllIn)
+            } else {
+                Some(Action::Raise { to: bet.raise_to })
+            }
+        }
+    }
+}
+
+/// 点按钮 → 发下注意图。
+fn bet_hud_buttons(
+    bet: Res<Bet>,
+    mut ev: EventWriter<BetIntent>,
+    q: Query<(&Interaction, &BetButton), Changed<Interaction>>,
+) {
+    if !bet.active {
+        return;
+    }
+    for (interaction, kind) in &q {
+        if *interaction == Interaction::Pressed {
+            if let Some(action) = intent_for(*kind, &bet) {
+                ev.send(BetIntent { action, kind: *kind });
+            }
+        }
+    }
+}
+
+/// 键盘下注：Q过 W跟 E加注 R弃 T全下（与按钮等效，统一走意图）。
+fn bet_keys(keys: Res<ButtonInput<KeyCode>>, bet: Res<Bet>, mut ev: EventWriter<BetIntent>) {
+    if !bet.active {
+        return;
+    }
+    let intent = if keys.just_pressed(KeyCode::KeyQ) {
+        intent_for(BetButton::Check, &bet).map(|a| (a, BetButton::Check))
+    } else if keys.just_pressed(KeyCode::KeyW) {
+        Some((Action::Call, BetButton::Call))
+    } else if keys.just_pressed(KeyCode::KeyE) {
+        intent_for(BetButton::Raise, &bet).map(|a| (a, BetButton::Raise))
+    } else if keys.just_pressed(KeyCode::KeyR) {
+        Some((Action::Fold, BetButton::Fold))
+    } else if keys.just_pressed(KeyCode::KeyT) {
+        bet.can_raise().then_some((Action::AllIn, BetButton::Raise))
+    } else {
+        None
+    };
+    if let Some((action, kind)) = intent {
+        ev.send(BetIntent { action, kind });
+    }
+}
+
+/// 拖动加注拉杆：按住轨道时按光标 x 设置加注额。
+fn bet_slider_drag(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut bet: ResMut<Bet>,
+    track: Query<(&Interaction, &GlobalTransform), With<RaiseTrack>>,
+) {
+    if !bet.active || bet.max_raise <= bet.min_raise {
+        return;
+    }
+    let Ok(window) = windows.get_single() else { return };
+    let Some(cursor) = window.cursor_position() else { return };
+    for (interaction, gt) in &track {
+        if *interaction == Interaction::Pressed {
+            let left = gt.translation().x - SLIDER_W / 2.0;
+            let frac = ((cursor.x - left) / SLIDER_W).clamp(0.0, 1.0);
+            let span = (bet.max_raise - bet.min_raise) as f32;
+            bet.raise_to = bet.min_raise + (frac * span).round() as u32;
+        }
+    }
+}
+
+/// 单机：执行下注意图。
+fn apply_bet_sp(mut ev: EventReader<BetIntent>, mut session: ResMut<GameSession>) {
+    for intent in ev.read() {
+        let g = &mut session.mtch.hand;
+        if matches!(g.phase, Phase::Showdown | Phase::Done) || g.players[g.to_act].is_ai {
+            continue;
+        }
+        let _ = g.apply(intent.action);
+    }
+}
+
+/// 联机：把下注意图发给服务器。
+fn send_bet_mp(mut ev: EventReader<BetIntent>, client: Option<ResMut<RenetClient>>, net: Option<Res<Net>>) {
+    let (Some(mut client), Some(net)) = (client, net) else {
+        ev.clear();
+        return;
+    };
+    let your_turn = net.view.as_ref().map(|v| v.to_act_seat.is_some() && v.to_act_seat == v.you_seat).unwrap_or(false);
+    for intent in ev.read() {
+        if your_turn {
+            client.send_message(DefaultChannel::ReliableOrdered, ClientMsg::Act { action: intent.action }.encode());
+        }
+    }
+}
+
+/// 特效：每次下注意图，在屏幕中下方冒一个带色飘字。
+fn bet_effects(mut commands: Commands, mut ev: EventReader<BetIntent>) {
+    for intent in ev.read() {
+        let (txt, col) = match intent.kind {
+            BetButton::Check => ("过牌", BET_COL_CHECK),
+            BetButton::Call => ("跟注!", BET_COL_CALL),
+            BetButton::Fold => ("弃牌", BET_COL_FOLD),
+            BetButton::Raise => {
+                if intent.action == Action::AllIn {
+                    ("全下!!", Color::srgb(0.95, 0.4, 0.3))
+                } else {
+                    ("加注!", BET_COL_RAISE)
+                }
+            }
+        };
+        commands.spawn((
+            Floater { timer: Timer::from_seconds(0.9, TimerMode::Once) },
+            Text::new(txt),
+            TextFont { font_size: 64.0, ..default() },
+            TextColor(col),
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(940.0),
+                top: Val::Px(840.0),
+                ..default()
+            },
+            GlobalZIndex(80),
+        ));
+    }
+}
+
+/// 飘字动画：上浮 + 淡出，结束销毁。
+fn floaters(mut commands: Commands, time: Res<Time>, mut q: Query<(Entity, &mut Floater, &mut Node, &mut TextColor)>) {
+    for (e, mut f, mut node, mut color) in &mut q {
+        f.timer.tick(time.delta());
+        if let Val::Px(t) = node.top {
+            node.top = Val::Px(t - 70.0 * time.delta_secs());
+        }
+        color.0.set_alpha(1.0 - f.timer.fraction());
+        if f.timer.finished() {
+            commands.entity(e).despawn_recursive();
+        }
+    }
 }
 
 // ============================ 设置（占位）============================
