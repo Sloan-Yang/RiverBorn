@@ -225,6 +225,49 @@ struct SelectCountText;
 #[derive(Component)]
 struct ConfirmButton;
 
+/// 每张牌位的动画状态：记录布局基准坐标/尺寸，由 animate_cards 据悬停 + 发牌重算 Node。
+/// 不能直接读 Node 当基准——Node 每帧被本动画改写，必须留一份原始布局值。
+#[derive(Component)]
+struct Card {
+    left: f32,
+    top: f32,
+    w: f32,
+    h: f32,
+    lift: f32,      // 悬停抬升进度 0..1（平滑趋近）
+    deal: f32,      // 发牌/翻牌弹跳余量 1..0
+    was_face: bool, // 上帧是否已亮牌面（用来识别「刚翻开」触发发牌动画）
+}
+
+impl Card {
+    fn new(left: f32, top: f32, w: f32, h: f32) -> Self {
+        Card { left, top, w, h, lift: 0.0, deal: 0.0, was_face: false }
+    }
+}
+
+/// 底池金额的显示状态（全局；SP/MP 各自每帧写 target）。
+#[derive(Resource, Default)]
+struct PotState {
+    shown: f32,      // 平滑显示中的数值
+    target: u32,     // 真实底池
+    last_target: u32, // 上次的 target，用来识别「底池涨了」
+    flash: f32,      // 涨钱时的高亮脉冲 1..0
+    chip_tier: Option<usize>, // 当前筹码堆已渲染的枚数（变了才重建）
+}
+
+/// 底池面板根 / 金额文字 / 筹码堆容器 / 落入底池的筹码动画。
+#[derive(Component)]
+struct PotDisplayRoot;
+#[derive(Component)]
+struct PotAmountText;
+#[derive(Component)]
+struct PotChipStack;
+#[derive(Component)]
+struct PotChip {
+    timer: Timer,
+    from_top: f32,
+    to_top: f32,
+}
+
 // 边框配色
 const COL_DIM: Color = Color::srgb(0.30, 0.32, 0.38);    // 未翻开/空位
 const COL_GOLD: Color = Color::srgb(0.85, 0.72, 0.35);   // 公共池
@@ -264,6 +307,32 @@ const HOLE_CARD_TOP_OFFSET: f32 = 96.0;
 const AVATAR_SIZE: f32 = 84.0;
 const SEAT_TEXT_X_OFFSET: f32 = AVATAR_SIZE + 12.0;
 
+const PLAYER_DOCK_X: f32 = 16.0;
+const PLAYER_DOCK_Y: f32 = 874.0;
+const PLAYER_DOCK_W: f32 = W - PLAYER_DOCK_X * 2.0;
+const PLAYER_DOCK_H: f32 = 190.0;
+const PLAYER_AVATAR_X: f32 = 36.0;
+const PLAYER_AVATAR_Y: f32 = PLAYER_DOCK_Y + (PLAYER_DOCK_H - AVATAR_SIZE) / 2.0;
+const PLAYER_STATUS_X: f32 = PLAYER_AVATAR_X + AVATAR_SIZE + 14.0;
+const PLAYER_STATUS_Y: f32 = PLAYER_DOCK_Y + 38.0;
+const PLAYER_ACTION_X: f32 = 380.0;
+const PLAYER_ACTION_Y: f32 = PLAYER_DOCK_Y + 44.0;
+const PLAYER_ACTION_W: f32 = 920.0;
+const PLAYER_ACTION_H: f32 = 116.0;
+const PLAYER_HOLE_CARD_H: f32 = 154.0;
+const PLAYER_HOLE_CARD_W: f32 = PLAYER_HOLE_CARD_H * CARD_ASPECT;
+const PLAYER_HOLE_X: f32 = W - 36.0 - PLAYER_HOLE_CARD_W * 2.0 - HOLE_CARD_GAP;
+const PLAYER_HOLE_Y: f32 = PLAYER_DOCK_Y + (PLAYER_DOCK_H - PLAYER_HOLE_CARD_H) / 2.0;
+const BORROW_BUTTON_X: f32 = 34.0;
+const BORROW_BUTTON_Y: f32 = PLAYER_DOCK_Y - 68.0;
+
+// 底池显示（牌桌中央、地牢池与玩家 dock 之间的空档）。
+const POT_W: f32 = 320.0;
+const POT_H: f32 = 92.0;
+const POT_X: f32 = (W - POT_W) / 2.0;
+const POT_Y: f32 = 752.0;
+const CHIP_D: f32 = 30.0; // 单枚筹码直径
+
 /// 牌桌背景现由 game_core 的 [`Scene`] 决定（每手随机 + 挂 buff），见 sync_scene_bg。
 /// 每局随机的卡背。
 const CARD_BACKS: [&str; 4] = ["card_back1", "card_back2", "card_back3", "card_back4"];
@@ -279,6 +348,7 @@ fn main() {
             ..default()
         }))
         .insert_resource(ClearColor(Color::srgb(0.08, 0.09, 0.12)))
+        .insert_resource(PotState::default())
         .add_plugins((RenetClientPlugin, NetcodeClientPlugin))
         .init_state::<AppState>()
         .add_sub_state::<PauseState>()
@@ -289,12 +359,16 @@ fn main() {
         // 下注 HUD（底部 4 按钮 + 加注拉杆 + 特效）：单机/联机共用，全程跑（自身判活）
         .add_systems(
             Update,
-            (bet_keys, bet_hud_buttons, bet_slider_drag, bet_hud_update, bet_effects, floaters),
+            (bet_keys, bet_hud_buttons, bet_slider_drag, bet_button_hover, bet_hud_update, bet_effects, floaters),
         )
+        // 牌面动画 + 底池显示：全程跑（无对应实体时自动空转）
+        .add_systems(Update, (animate_cards, pot_display, chip_drops))
         .add_systems(Update, bet_ctx_sp.run_if(in_state(PauseState::Running)))
         .add_systems(Update, apply_bet_sp.run_if(in_state(PauseState::Running)))
+        .add_systems(Update, update_pot_sp.run_if(in_state(AppState::SinglePlayer)))
         .add_systems(Update, bet_ctx_mp.run_if(in_state(MpState::InGame)))
         .add_systems(Update, send_bet_mp.run_if(in_state(MpState::InGame)))
+        .add_systems(Update, update_pot_mp.run_if(in_state(MpState::InGame)))
         // 主菜单
         .add_systems(OnEnter(AppState::MainMenu), enter_main_menu)
         .add_systems(Update, menu_buttons.run_if(in_state(AppState::MainMenu)))
@@ -615,27 +689,53 @@ fn avatar_file(seat: usize) -> String {
     }
 }
 
-/// 按人数返回各座位的左上角坐标（数量恰好等于人数，无空座）。
-/// 2：上 + 下；3：上 + 左下 + 右下；4：上下左右；5：上 + 两侧 + 左下右下；6：上下 + 四角。
-/// 联机最少 2 人——之前缺 2 人分支会落到 6 人兜底，多铺 4 个空座位（已修）。
-fn seat_positions(count: usize) -> Vec<(f32, f32)> {
+/// 对手座位坐标。底部留给本地玩家 dock，不再放其它座位。
+fn opponent_positions(count: usize) -> Vec<(f32, f32)> {
     const TOP: (f32, f32) = (1000.0, 28.0);
-    const BOTTOM: (f32, f32) = (1000.0, 840.0);
-    const TOP_LEFT: (f32, f32) = (24.0, 250.0);
-    const TOP_RIGHT: (f32, f32) = (1700.0, 250.0);
-    const MID_LEFT: (f32, f32) = (24.0, 440.0);
-    const MID_RIGHT: (f32, f32) = (1700.0, 440.0);
-    const BOTTOM_LEFT: (f32, f32) = (24.0, 700.0);
-    const BOTTOM_RIGHT: (f32, f32) = (1700.0, 700.0);
+    const TOP_LEFT: (f32, f32) = (520.0, 56.0);
+    const TOP_RIGHT: (f32, f32) = (1390.0, 56.0);
+    const MID_LEFT: (f32, f32) = (24.0, 260.0);
+    const MID_RIGHT: (f32, f32) = (1700.0, 260.0);
+    const LOW_LEFT: (f32, f32) = (24.0, 560.0);
+    const LOW_RIGHT: (f32, f32) = (1700.0, 560.0);
     match count {
         0 => vec![],
         1 => vec![TOP],
-        2 => vec![TOP, BOTTOM],
-        3 => vec![TOP, BOTTOM_LEFT, BOTTOM_RIGHT],
-        4 => vec![TOP, BOTTOM, MID_LEFT, MID_RIGHT],
-        5 => vec![TOP, MID_LEFT, MID_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT],
-        _ => vec![TOP, BOTTOM, TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT], // 6（也兜底 >6）
+        2 => vec![MID_LEFT, MID_RIGHT],
+        3 => vec![TOP, MID_LEFT, MID_RIGHT],
+        4 => vec![TOP_LEFT, TOP_RIGHT, MID_LEFT, MID_RIGHT],
+        _ => vec![TOP, TOP_LEFT, TOP_RIGHT, LOW_LEFT, LOW_RIGHT],
     }
+}
+
+/// 返回 (seat index, avatar x, avatar y)。本地玩家固定在底部 dock，其余座位围绕牌桌。
+fn seat_layout(count: usize, local_seat: usize) -> Vec<(usize, f32, f32)> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let local = local_seat.min(count - 1);
+    let mut layout = vec![(local, PLAYER_AVATAR_X, PLAYER_AVATAR_Y)];
+    let opponents = opponent_positions(count.saturating_sub(1));
+    for (seat, (x, y)) in (0..count).filter(|&seat| seat != local).zip(opponents) {
+        layout.push((seat, x, y));
+    }
+    layout
+}
+
+fn spawn_player_dock(commands: &mut Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(PLAYER_DOCK_X),
+            top: Val::Px(PLAYER_DOCK_Y),
+            width: Val::Px(PLAYER_DOCK_W),
+            height: Val::Px(PLAYER_DOCK_H),
+            border: UiRect::all(Val::Px(2.0)),
+            ..default()
+        },
+        BorderColor(Color::srgba(0.68, 0.72, 0.82, 0.35)),
+        BackgroundColor(Color::srgba(0.03, 0.04, 0.06, 0.76)),
+    ));
 }
 
 /// 用系统时间生成一个打散过的随机种子（time % N 在 Windows 上有偏置，先过 PRNG）。
@@ -738,30 +838,39 @@ fn enter_single_player(
         "Dungeon / Boss",
     );
 
-    // 6) 座位：按人数取布局，逐个真实玩家摆头像 + 名字 + 两张底牌位（无空座）。
-    let positions = seat_positions(session.mtch.seats.len());
-    for (seat, (x, y)) in positions.iter().enumerate() {
-        spawn_avatar(&mut commands, *x, *y, assets.load(avatar_file(seat)));
-        spawn_seat_name(&mut commands, x + SEAT_TEXT_X_OFFSET, *y, seat);
-        let x0 = *x;
-        let x1 = x + HOLE_CARD_W + HOLE_CARD_GAP;
-        let cy = y + HOLE_CARD_TOP_OFFSET;
-        spawn_card(&mut commands, x0, cy, HOLE_CARD_W, HOLE_CARD_H, COL_HOLE, card_back.clone(), Slot::Hole { seat, idx: 0 });
-        spawn_value_label(&mut commands, x0, cy, HOLE_CARD_W, HOLE_CARD_H, Slot::Hole { seat, idx: 0 });
-        spawn_card(&mut commands, x1, cy, HOLE_CARD_W, HOLE_CARD_H, COL_HOLE, card_back.clone(), Slot::Hole { seat, idx: 1 });
-        spawn_value_label(&mut commands, x1, cy, HOLE_CARD_W, HOLE_CARD_H, Slot::Hole { seat, idx: 1 });
+    // 6) 座位：本地玩家固定在底部 dock；对手围绕牌桌。
+    spawn_player_dock(&mut commands);
+    for (seat, x, y) in seat_layout(session.mtch.seats.len(), 0) {
+        let local = seat == 0;
+        spawn_avatar(&mut commands, x, y, assets.load(avatar_file(seat)));
+        spawn_seat_name(
+            &mut commands,
+            if local { PLAYER_STATUS_X } else { x + SEAT_TEXT_X_OFFSET },
+            if local { PLAYER_STATUS_Y } else { y },
+            seat,
+        );
+        let (card_w, card_h, x0, cy) = if local {
+            (PLAYER_HOLE_CARD_W, PLAYER_HOLE_CARD_H, PLAYER_HOLE_X, PLAYER_HOLE_Y)
+        } else {
+            (HOLE_CARD_W, HOLE_CARD_H, x, y + HOLE_CARD_TOP_OFFSET)
+        };
+        let x1 = x0 + card_w + HOLE_CARD_GAP;
+        spawn_card(&mut commands, x0, cy, card_w, card_h, COL_HOLE, card_back.clone(), Slot::Hole { seat, idx: 0 });
+        spawn_value_label(&mut commands, x0, cy, card_w, card_h, Slot::Hole { seat, idx: 0 });
+        spawn_card(&mut commands, x1, cy, card_w, card_h, COL_HOLE, card_back.clone(), Slot::Hole { seat, idx: 1 });
+        spawn_value_label(&mut commands, x1, cy, card_w, card_h, Slot::Hole { seat, idx: 1 });
     }
 
     // 7) 「借一锅」按钮：默认隐藏，borrow_button 系统按人类筹码情况显隐。
-    //    放在左下角空白处，不与牌桌布局冲突；要挪位改这里的 left/top 即可。
+    //    放在底部 dock 上方，不占用主要操作区。
     commands
         .spawn((
             Button,
             BorrowButton,
             Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(24.0),
-                top: Val::Px(980.0),
+                left: Val::Px(BORROW_BUTTON_X),
+                top: Val::Px(BORROW_BUTTON_Y),
                 width: Val::Px(240.0),
                 height: Val::Px(56.0),
                 justify_content: JustifyContent::Center,
@@ -785,6 +894,8 @@ fn enter_single_player(
     // 清掉可能残留的点选状态（上次中途离开单人留下的）。
     commands.remove_resource::<Selection>();
     spawn_bet_hud(&mut commands);
+    spawn_pot_display(&mut commands);
+    commands.insert_resource(PotState::default()); // 新局重置底池显示（含筹码堆重建标记）
     commands.insert_resource(RevealCount(0));
     commands.insert_resource(session);
 }
@@ -835,6 +946,12 @@ fn spawn_card(
             },
             BorderColor(border),
             slot,
+            // 悬停弹出 / 发牌动画所需：可交互 + 可调 z + 描边光晕 + 基准坐标。
+            Button,
+            Interaction::default(),
+            GlobalZIndex(0),
+            Outline { width: Val::Px(0.0), offset: Val::Px(2.0), color: COL_SELECT },
+            Card::new(x, y, w, h),
         ))
         .id()
 }
@@ -864,6 +981,7 @@ fn spawn_seat_name(commands: &mut Commands, x: f32, y: f32, seat: usize) {
             position_type: PositionType::Absolute,
             left: Val::Px(x),
             top: Val::Px(y),
+            max_width: Val::Px(230.0),
             ..default()
         },
         Slot::SeatName(seat),
@@ -938,19 +1056,20 @@ fn refresh(
     back: Res<CardBack>,
     assets: Res<AssetServer>,
     selection: Option<Res<Selection>>,
-    mut q: Query<(Option<&mut Text>, Option<&mut ImageNode>, Option<&mut BorderColor>, &Slot)>,
+    mut q: Query<(Option<&mut Text>, Option<&mut ImageNode>, Option<&mut BorderColor>, Option<&mut Card>, &Slot)>,
 ) {
     let m = &session.mtch;
     let g = &m.hand;
     // 点选阶段公共牌边框由 selection_ui_update 接管（高亮选中），这里不要覆盖。
     let selecting = selection.is_some();
-    for (text, image, border, slot) in &mut q {
+    for (text, image, border, card, slot) in &mut q {
         // 同一个 Slot 可能既有图片牌位、又有数值文字位；下面三个 setter 各取所需。
         match slot {
             Slot::Status => set_text(text, status_text(m)),
             Slot::SeatName(seat) => set_text(text, seat_name_text(m, *seat)),
             Slot::Community(i) => {
-                let (handle, col, val) = match g.community.get(*i) {
+                let face = g.community.get(*i);
+                let (handle, col, val) = match face {
                     Some(c) => (assets.load(format!("cards/community/{}.png", c.art())), COL_GOLD, community_value(c)),
                     None => (back.0.clone(), COL_DIM, String::new()),
                 };
@@ -959,23 +1078,28 @@ fn refresh(
                     set_border(border, col);
                 }
                 set_text(text, val);
+                note_reveal(card, face.is_some());
             }
             Slot::Dungeon(i) => {
-                let (handle, col, val) = match g.dungeon.get(*i) {
+                let face = g.dungeon.get(*i);
+                let (handle, col, val) = match face {
                     Some(mon) => (assets.load(format!("cards/dungeon/{}.png", mon.art)), COL_RED, format!("T{}  H{}", mon.threat, mon.health)),
                     None => (back.0.clone(), COL_DIM, String::new()),
                 };
                 set_image(image, handle);
                 set_border(border, col);
                 set_text(text, val);
+                note_reveal(card, face.is_some());
             }
             Slot::Hole { seat, idx } => {
+                let mut revealed = false;
                 let (handle, col, val) = match g.players.get(*seat) {
                     None => (back.0.clone(), COL_DIM, String::new()),
                     Some(p) => {
                         // 隐藏信息：只亮出人类自己的底牌；摊牌与结算阶段(Showdown/Done)全亮。
                         let over = matches!(g.phase, Phase::Showdown | Phase::Done);
                         let reveal = !p.is_ai || over;
+                        revealed = reveal;
                         let a = &p.hole[*idx];
                         let (h, v) = if reveal {
                             (assets.load(format!("cards/community/{}.png", a.art)), format!("P{}  H{}", a.power, a.health))
@@ -989,8 +1113,19 @@ fn refresh(
                 set_image(image, handle);
                 set_border(border, col);
                 set_text(text, val);
+                note_reveal(card, revealed);
             }
         }
+    }
+}
+
+/// 牌位由「盖着」翻成「亮面」时，触发一次发牌弹跳动画。
+fn note_reveal(card: Option<Mut<Card>>, is_face: bool) {
+    if let Some(mut c) = card {
+        if is_face && !c.was_face {
+            c.deal = 1.0;
+        }
+        c.was_face = is_face;
     }
 }
 
@@ -1510,26 +1645,37 @@ fn enter_mp_game(
     }
     spawn_label(&mut commands, DUNGEON_POOL_X, DUNGEON_POOL_Y - 28.0, "Dungeon / Boss");
 
-    // 座位。
-    for (seat, (x, y)) in seat_positions(count).iter().enumerate() {
-        spawn_avatar(&mut commands, *x, *y, assets.load(mp_avatar_file(seat, you)));
-        spawn_seat_name(&mut commands, x + SEAT_TEXT_X_OFFSET, *y, seat);
-        let x1 = x + HOLE_CARD_W + HOLE_CARD_GAP;
-        let cy = y + HOLE_CARD_TOP_OFFSET;
-        spawn_card(&mut commands, *x, cy, HOLE_CARD_W, HOLE_CARD_H, COL_HOLE, card_back.clone(), Slot::Hole { seat, idx: 0 });
-        spawn_value_label(&mut commands, *x, cy, HOLE_CARD_W, HOLE_CARD_H, Slot::Hole { seat, idx: 0 });
-        spawn_card(&mut commands, x1, cy, HOLE_CARD_W, HOLE_CARD_H, COL_HOLE, card_back.clone(), Slot::Hole { seat, idx: 1 });
-        spawn_value_label(&mut commands, x1, cy, HOLE_CARD_W, HOLE_CARD_H, Slot::Hole { seat, idx: 1 });
+    // 座位：当前客户端自己的座位固定在底部 dock，其它座位围绕牌桌。
+    spawn_player_dock(&mut commands);
+    for (seat, x, y) in seat_layout(count, you) {
+        let local = seat == you;
+        spawn_avatar(&mut commands, x, y, assets.load(mp_avatar_file(seat, you)));
+        spawn_seat_name(
+            &mut commands,
+            if local { PLAYER_STATUS_X } else { x + SEAT_TEXT_X_OFFSET },
+            if local { PLAYER_STATUS_Y } else { y },
+            seat,
+        );
+        let (card_w, card_h, x0, cy) = if local {
+            (PLAYER_HOLE_CARD_W, PLAYER_HOLE_CARD_H, PLAYER_HOLE_X, PLAYER_HOLE_Y)
+        } else {
+            (HOLE_CARD_W, HOLE_CARD_H, x, y + HOLE_CARD_TOP_OFFSET)
+        };
+        let x1 = x0 + card_w + HOLE_CARD_GAP;
+        spawn_card(&mut commands, x0, cy, card_w, card_h, COL_HOLE, card_back.clone(), Slot::Hole { seat, idx: 0 });
+        spawn_value_label(&mut commands, x0, cy, card_w, card_h, Slot::Hole { seat, idx: 0 });
+        spawn_card(&mut commands, x1, cy, card_w, card_h, COL_HOLE, card_back.clone(), Slot::Hole { seat, idx: 1 });
+        spawn_value_label(&mut commands, x1, cy, card_w, card_h, Slot::Hole { seat, idx: 1 });
     }
 
-    // 借一锅按钮（默认隐藏，refresh 按 view.low_chips 显隐）。
+    // 借一锅按钮（默认隐藏，refresh 按 view.low_chips 显隐），放在 dock 上方。
     commands.spawn((
         Button,
         BorrowButton,
         Node {
             position_type: PositionType::Absolute,
-            left: Val::Px(24.0),
-            top: Val::Px(980.0),
+            left: Val::Px(BORROW_BUTTON_X),
+            top: Val::Px(BORROW_BUTTON_Y),
             width: Val::Px(240.0),
             height: Val::Px(56.0),
             justify_content: JustifyContent::Center,
@@ -1551,6 +1697,8 @@ fn enter_mp_game(
     });
 
     spawn_bet_hud(&mut commands);
+    spawn_pot_display(&mut commands);
+    commands.insert_resource(PotState::default()); // 新局重置底池显示（含筹码堆重建标记）
 }
 
 /// 用最新视图刷新所有牌槽 + 借锅按钮显隐 + 背景。
@@ -1559,7 +1707,7 @@ fn mp_game_refresh(
     back: Res<CardBack>,
     assets: Res<AssetServer>,
     selection: Option<Res<Selection>>,
-    mut q: Query<(Option<&mut Text>, Option<&mut ImageNode>, Option<&mut BorderColor>, &Slot)>,
+    mut q: Query<(Option<&mut Text>, Option<&mut ImageNode>, Option<&mut BorderColor>, Option<&mut Card>, &Slot)>,
     mut bg_q: Query<&mut ImageNode, (With<SceneBackground>, Without<Slot>)>,
     mut borrow_q: Query<&mut Node, With<BorrowButton>>,
 ) {
@@ -1575,12 +1723,13 @@ fn mp_game_refresh(
         node.display = if view.low_chips { Display::Flex } else { Display::None };
     }
 
-    for (text, image, border, slot) in &mut q {
+    for (text, image, border, card_anim, slot) in &mut q {
         match slot {
             Slot::Status => set_text(text, mp_status_text(view)),
             Slot::SeatName(seat) => set_text(text, mp_seat_text(view, *seat)),
             Slot::Community(i) => {
-                let (handle, col, val) = match view.community.get(*i) {
+                let face = view.community.get(*i);
+                let (handle, col, val) = match face {
                     Some(c) => (assets.load(format!("cards/community/{}.png", c.art)), COL_GOLD, c.label.clone()),
                     None => (back.0.clone(), COL_DIM, String::new()),
                 };
@@ -1589,15 +1738,18 @@ fn mp_game_refresh(
                     set_border(border, col);
                 }
                 set_text(text, val);
+                note_reveal(card_anim, face.is_some());
             }
             Slot::Dungeon(i) => {
-                let (handle, col, val) = match view.dungeon.get(*i) {
+                let face = view.dungeon.get(*i);
+                let (handle, col, val) = match face {
                     Some(c) => (assets.load(format!("cards/dungeon/{}.png", c.art)), COL_RED, c.label.clone()),
                     None => (back.0.clone(), COL_DIM, String::new()),
                 };
                 set_image(image, handle);
                 set_border(border, col);
                 set_text(text, val);
+                note_reveal(card_anim, face.is_some());
             }
             Slot::Hole { seat, idx } => {
                 let seat = *seat;
@@ -1617,6 +1769,7 @@ fn mp_game_refresh(
                 set_image(image, handle);
                 set_border(border, col);
                 set_text(text, val);
+                note_reveal(card_anim, card.is_some());
             }
         }
     }
@@ -1958,10 +2111,10 @@ fn spawn_bet_hud(commands: &mut Commands) {
             BetHud,
             Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(560.0),
-                top: Val::Px(978.0),
-                width: Val::Px(928.0),
-                height: Val::Px(94.0),
+                left: Val::Px(PLAYER_ACTION_X),
+                top: Val::Px(PLAYER_ACTION_Y),
+                width: Val::Px(PLAYER_ACTION_W),
+                height: Val::Px(PLAYER_ACTION_H),
                 flex_direction: FlexDirection::Row,
                 column_gap: Val::Px(14.0),
                 align_items: AlignItems::Center,
@@ -1972,9 +2125,9 @@ fn spawn_bet_hud(commands: &mut Commands) {
             GlobalZIndex(45),
         ))
         .with_children(|hud| {
-            bet_btn(hud, BetButton::Fold, "弃牌");
             bet_btn(hud, BetButton::Check, "过牌");
             bet_btn(hud, BetButton::Call, "跟注");
+            bet_btn(hud, BetButton::Fold, "弃牌");
             // 加注：拉杆 + 按钮一列。
             hud.spawn(Node {
                 flex_direction: FlexDirection::Column,
@@ -2222,25 +2375,78 @@ fn bet_keys(keys: Res<ButtonInput<KeyCode>>, bet: Res<Bet>, mut ev: EventWriter<
     }
 }
 
-/// 拖动加注拉杆：按住轨道时按光标 x 设置加注额。
+/// 拖动加注拉杆：在轨道上按下即开始拖，按住期间持续按光标 x 设额（即使光标移出轨道）。
+/// 不依赖轨道自身的 `Interaction::Pressed`（滑块子节点会挡住它，且光标移出就丢失），
+/// 改用原始鼠标状态 + 轨道矩形自行判定，这样才真的拖得动。
 fn bet_slider_drag(
     windows: Query<&Window, With<PrimaryWindow>>,
+    mouse: Res<ButtonInput<MouseButton>>,
     mut bet: ResMut<Bet>,
-    track: Query<(&Interaction, &GlobalTransform), With<RaiseTrack>>,
+    track: Query<&GlobalTransform, With<RaiseTrack>>,
+    mut dragging: Local<bool>,
 ) {
     if !bet.active || bet.max_raise <= bet.min_raise {
+        *dragging = false;
         return;
+    }
+    if !mouse.pressed(MouseButton::Left) {
+        *dragging = false;
     }
     let Ok(window) = windows.get_single() else { return };
     let Some(cursor) = window.cursor_position() else { return };
-    for (interaction, gt) in &track {
-        if *interaction == Interaction::Pressed {
-            let left = gt.translation().x - SLIDER_W / 2.0;
-            let frac = ((cursor.x - left) / SLIDER_W).clamp(0.0, 1.0);
-            let span = (bet.max_raise - bet.min_raise) as f32;
-            bet.raise_to = bet.min_raise + (frac * span).round() as u32;
-        }
+    let Ok(gt) = track.get_single() else { return };
+    let center = gt.translation();
+    let left = center.x - SLIDER_W / 2.0;
+    let top = center.y - 11.0; // 轨道高 22
+    // 命中区：横向略放宽，纵向覆盖滑块（不向下延伸到「加注」按钮，免得点按钮时误改额）。
+    let within = cursor.x >= left - 10.0
+        && cursor.x <= left + SLIDER_W + 10.0
+        && cursor.y >= top - 12.0
+        && cursor.y <= top + 26.0;
+    if mouse.just_pressed(MouseButton::Left) && within {
+        *dragging = true;
     }
+    if *dragging {
+        let frac = ((cursor.x - left) / SLIDER_W).clamp(0.0, 1.0);
+        let span = (bet.max_raise - bet.min_raise) as f32;
+        bet.raise_to = bet.min_raise + (frac * span).round() as u32;
+    }
+}
+
+/// 下注按钮悬停放大 + 边框高亮（用 Transform 缩放，不触发 flex 重排）。
+fn bet_button_hover(
+    time: Res<Time>,
+    bet: Res<Bet>,
+    mut q: Query<(&Interaction, &BetButton, &mut Transform, &mut BorderColor)>,
+) {
+    let k = 1.0 - (-time.delta_secs() * 16.0).exp();
+    let base = Color::srgb(0.45, 0.48, 0.58);
+    let bright = Color::srgb(0.95, 0.85, 0.45);
+    for (interaction, kind, mut tf, mut border) in &mut q {
+        let enabled = match kind {
+            BetButton::Check => bet.can_check,
+            BetButton::Call => bet.need() > 0,
+            BetButton::Fold => true,
+            BetButton::Raise => bet.can_raise(),
+        };
+        let hovered = bet.active && enabled && matches!(interaction, Interaction::Hovered | Interaction::Pressed);
+        let target = if hovered { 1.12 } else { 1.0 };
+        let next = tf.scale.x + (target - tf.scale.x) * k;
+        tf.scale = Vec3::new(next, next, 1.0);
+        let t = ((next - 1.0) / 0.12).clamp(0.0, 1.0);
+        border.0 = mix_color(base, bright, t);
+    }
+}
+
+/// 两色线性插值（用于悬停高亮渐变）。
+fn mix_color(a: Color, b: Color, t: f32) -> Color {
+    let a = a.to_srgba();
+    let b = b.to_srgba();
+    Color::srgb(
+        a.red + (b.red - a.red) * t,
+        a.green + (b.green - a.green) * t,
+        a.blue + (b.blue - a.blue) * t,
+    )
 }
 
 /// 单机：执行下注意图。
@@ -2308,6 +2514,238 @@ fn floaters(mut commands: Commands, time: Res<Time>, mut q: Query<(Entity, &mut 
         }
         color.0.set_alpha(1.0 - f.timer.fraction());
         if f.timer.finished() {
+            commands.entity(e).despawn_recursive();
+        }
+    }
+}
+
+// ============================ 牌面动画 + 底池 ============================
+
+/// 牌位动画：悬停弹出（抬升 + 放大 + 描边光晕 + 置顶）与发牌/翻牌弹跳。
+/// 全程跑，没有 Card 组件的实体不受影响。
+fn animate_cards(
+    time: Res<Time>,
+    mut q: Query<(&Interaction, &mut Card, &mut Node, &mut GlobalZIndex, &mut Outline)>,
+) {
+    let dt = time.delta_secs();
+    let k = 1.0 - (-dt * 16.0).exp(); // 指数平滑系数（帧率无关）
+    for (interaction, mut card, mut node, mut z, mut outline) in &mut q {
+        let target = if matches!(interaction, Interaction::Hovered | Interaction::Pressed) { 1.0 } else { 0.0 };
+        card.lift += (target - card.lift) * k;
+        if card.deal > 0.0 {
+            card.deal = (card.deal - dt * 4.0).max(0.0); // 约 0.25s
+        }
+        let lift = card.lift;
+        // 发牌弹跳：从放大 +0.30 收回到 0（平方让收尾更柔和）。
+        let punch = 0.30 * card.deal * card.deal;
+        let scale = 1.0 + 0.12 * lift + punch;
+        let w = card.w * scale;
+        let h = card.h * scale;
+        node.width = Val::Px(w);
+        node.height = Val::Px(h);
+        node.left = Val::Px(card.left - (w - card.w) / 2.0);
+        node.top = Val::Px(card.top - (h - card.h) / 2.0 - 18.0 * lift);
+        z.0 = if lift > 0.02 || card.deal > 0.0 { 50 } else { 0 };
+        outline.width = Val::Px(3.5 * lift);
+        outline.color = COL_SELECT.with_alpha(lift);
+    }
+}
+
+/// 牌桌中央的底池面板：装饰筹码堆 + 实时金额。单机/联机进局时各调一次。
+fn spawn_pot_display(commands: &mut Commands) {
+    commands
+        .spawn((
+            PotDisplayRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(POT_X),
+                top: Val::Px(POT_Y),
+                width: Val::Px(POT_W),
+                height: Val::Px(POT_H),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                column_gap: Val::Px(16.0),
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor(Color::srgba(0.85, 0.72, 0.35, 0.55)),
+            BackgroundColor(Color::srgba(0.05, 0.045, 0.03, 0.72)),
+            BorderRadius::all(Val::Px(16.0)),
+            GlobalZIndex(40),
+        ))
+        .with_children(|p| {
+            // 筹码堆容器（枚数随底池增多，由 pot_display 重建）。
+            p.spawn((
+                Node {
+                    width: Val::Px(86.0),
+                    height: Val::Px(70.0),
+                    ..default()
+                },
+                PotChipStack,
+            ));
+            p.spawn((
+                Text::new("底池 0"),
+                TextFont { font_size: 34.0, ..default() },
+                TextColor(Color::srgb(0.97, 0.86, 0.50)),
+                PotAmountText,
+            ));
+        });
+}
+
+/// 底池筹码枚数：每 100 一枚，封顶 18。底池为 0 时不显示。
+fn chip_count(pot: u32) -> usize {
+    if pot == 0 {
+        0
+    } else {
+        ((pot / 100) as usize + 1).min(18)
+    }
+}
+
+/// 按枚数重建筹码堆：分列（每列 6 枚）向上叠放，像扑克筹码堆。
+fn rebuild_chip_stack(commands: &mut Commands, stack: Entity, n: usize) {
+    commands.entity(stack).despawn_descendants();
+    commands.entity(stack).with_children(|p| {
+        for i in 0..n {
+            let col = (i / 6) as f32;
+            let row = (i % 6) as f32;
+            let color = match i % 4 {
+                0 => Color::srgb(0.78, 0.22, 0.24),
+                1 => Color::srgb(0.22, 0.40, 0.72),
+                2 => Color::srgb(0.24, 0.58, 0.34),
+                _ => Color::srgb(0.90, 0.74, 0.30),
+            };
+            p.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(col * 18.0),
+                    top: Val::Px(40.0 - row * 8.0),
+                    width: Val::Px(CHIP_D),
+                    height: Val::Px(CHIP_D),
+                    border: UiRect::all(Val::Px(3.0)),
+                    ..default()
+                },
+                BorderColor(Color::srgba(1.0, 1.0, 1.0, 0.65)),
+                BackgroundColor(color),
+                BorderRadius::all(Val::Px(CHIP_D / 2.0)),
+            ));
+        }
+    });
+}
+
+/// 单机：每帧把本地底池写进 PotState。
+fn update_pot_sp(session: Option<Res<GameSession>>, mut pot: ResMut<PotState>) {
+    if let Some(s) = session {
+        pot.target = s.mtch.hand.pot;
+    }
+}
+
+/// 联机：每帧把服务器视图的底池写进 PotState。
+fn update_pot_mp(net: Option<Res<Net>>, mut pot: ResMut<PotState>) {
+    if let Some(net) = net {
+        if let Some(view) = &net.view {
+            pot.target = view.pot;
+        }
+    }
+}
+
+/// 刷新底池数字（平滑滚动）；涨钱时脉冲高亮并撒筹码落入底池。
+fn pot_display(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut pot: ResMut<PotState>,
+    mut text_q: Query<(&mut Text, &mut TextFont), With<PotAmountText>>,
+    mut root_q: Query<&mut BorderColor, With<PotDisplayRoot>>,
+    stack_q: Query<Entity, With<PotChipStack>>,
+) {
+    if pot.target != pot.last_target {
+        if pot.target > pot.last_target {
+            pot.flash = 1.0;
+            spawn_pot_chips(&mut commands);
+        } else {
+            // 新一手底池清零：直接归位，别从大数往下滚。
+            pot.shown = pot.target as f32;
+        }
+        pot.last_target = pot.target;
+    }
+    // 筹码堆枚数随底池变化时重建。
+    let tier = chip_count(pot.target);
+    if pot.chip_tier != Some(tier) {
+        pot.chip_tier = Some(tier);
+        if let Ok(stack) = stack_q.get_single() {
+            rebuild_chip_stack(&mut commands, stack, tier);
+        }
+    }
+    let dt = time.delta_secs();
+    pot.shown += (pot.target as f32 - pot.shown) * (1.0 - (-dt * 9.0).exp());
+    if (pot.shown - pot.target as f32).abs() < 0.5 {
+        pot.shown = pot.target as f32;
+    }
+    pot.flash = (pot.flash - dt * 1.8).max(0.0);
+    let flash = pot.flash;
+    for (mut t, mut font) in &mut text_q {
+        t.0 = format!("底池 {}", pot.shown.round() as u32);
+        font.font_size = 34.0 + 12.0 * flash;
+    }
+    for mut bc in &mut root_q {
+        bc.0 = Color::srgba(
+            (0.85 + 0.15 * flash).min(1.0),
+            (0.72 + 0.22 * flash).min(1.0),
+            0.35 + 0.40 * flash,
+            (0.55 + 0.45 * flash).min(1.0),
+        );
+    }
+}
+
+/// 撒一把筹码从上方落入底池（涨钱时调用）。
+fn spawn_pot_chips(commands: &mut Commands) {
+    let cx = POT_X + POT_W / 2.0;
+    let mut rng = game_core::rng::Rng::new(random_seed());
+    for _ in 0..5 {
+        let off = (rng.next_u64() % 140) as f32 - 70.0;
+        let col = match rng.next_u64() % 4 {
+            0 => Color::srgb(0.78, 0.22, 0.24),
+            1 => Color::srgb(0.22, 0.40, 0.72),
+            2 => Color::srgb(0.24, 0.58, 0.34),
+            _ => Color::srgb(0.90, 0.74, 0.30),
+        };
+        let left = cx + off - CHIP_D / 2.0;
+        let from_top = POT_Y - 130.0 - (rng.next_u64() % 50) as f32;
+        let to_top = POT_Y + 4.0 + (rng.next_u64() % 34) as f32;
+        commands.spawn((
+            PotChip { timer: Timer::from_seconds(0.55, TimerMode::Once), from_top, to_top },
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(left),
+                top: Val::Px(from_top),
+                width: Val::Px(CHIP_D),
+                height: Val::Px(CHIP_D),
+                border: UiRect::all(Val::Px(3.0)),
+                ..default()
+            },
+            BorderColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
+            BackgroundColor(col),
+            BorderRadius::all(Val::Px(CHIP_D / 2.0)),
+            GlobalZIndex(60),
+        ));
+    }
+}
+
+/// 筹码下落动画：加速落入底池，尾段淡出后销毁。
+fn chip_drops(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut PotChip, &mut Node, &mut BackgroundColor, &mut BorderColor)>,
+) {
+    for (e, mut chip, mut node, mut bg, mut border) in &mut q {
+        chip.timer.tick(time.delta());
+        let f = chip.timer.fraction();
+        let ease = 1.0 - (1.0 - f) * (1.0 - f); // ease-out（落下加速感）
+        node.top = Val::Px(chip.from_top + (chip.to_top - chip.from_top) * ease);
+        let a = if f > 0.7 { (1.0 - (f - 0.7) / 0.3).max(0.0) } else { 1.0 };
+        bg.0.set_alpha(a);
+        border.0.set_alpha(a * 0.7);
+        if chip.timer.finished() {
             commands.entity(e).despawn_recursive();
         }
     }
@@ -2555,8 +2993,8 @@ fn spawn_select_ui(commands: &mut Commands) {
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(290.0),
-                top: Val::Px(936.0),
+                left: Val::Px(PLAYER_ACTION_X),
+                top: Val::Px(BORROW_BUTTON_Y),
                 width: Val::Px(380.0),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(8.0),
