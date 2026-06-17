@@ -10,8 +10,10 @@
 
 use bevy::audio::{AudioPlayer, AudioSource, PlaybackSettings};
 use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::mouse::MouseWheel;
 use bevy::input::ButtonState;
 use bevy::prelude::*;
+use bevy::ui::RelativeCursorPosition;
 use bevy::window::PrimaryWindow;
 use bevy::winit::WinitWindows;
 use bevy_renet::netcode::{ClientAuthentication, NetcodeClientPlugin, NetcodeClientTransport};
@@ -2136,13 +2138,15 @@ fn spawn_bet_hud(commands: &mut Commands) {
                 ..default()
             })
             .with_children(|col| {
-                // 拉杆轨道（Button 以便接收点击/拖动），内含滑块。
+                // 拉杆轨道（内含滑块）。挂 RelativeCursorPosition 供 bet_slider_drag
+                // 拿到归一化光标位置（自动处理 DPI 缩放，避免拖不动）。
                 col.spawn((
                     Button,
                     RaiseTrack,
+                    RelativeCursorPosition::default(),
                     Node {
                         width: Val::Px(SLIDER_W),
-                        height: Val::Px(22.0),
+                        height: Val::Px(28.0),
                         border: UiRect::all(Val::Px(2.0)),
                         ..default()
                     },
@@ -2375,41 +2379,47 @@ fn bet_keys(keys: Res<ButtonInput<KeyCode>>, bet: Res<Bet>, mut ev: EventWriter<
     }
 }
 
-/// 拖动加注拉杆：在轨道上按下即开始拖，按住期间持续按光标 x 设额（即使光标移出轨道）。
-/// 不依赖轨道自身的 `Interaction::Pressed`（滑块子节点会挡住它，且光标移出就丢失），
-/// 改用原始鼠标状态 + 轨道矩形自行判定，这样才真的拖得动。
+/// 加注额控制：拖动拉杆（点哪跳哪、按住可拖）+ 滚轮微调。
+///
+/// 用 `RelativeCursorPosition`（Bevy 内部已处理 DPI 缩放 / 视口换算）拿轨道内的归一化
+/// 光标位置，避免「UI 的 GlobalTransform 是物理像素、cursor_position 是逻辑像素」在
+/// 缩放显示器上对不上导致的「拖不动」。单点拉杆 = 跳到该位置；按住拖 = 连续设额；
+/// 滚轮 = 每格 ±RAISE_STEP，作为稳妥的补充手段。
 fn bet_slider_drag(
-    windows: Query<&Window, With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
+    mut wheel: EventReader<MouseWheel>,
     mut bet: ResMut<Bet>,
-    track: Query<&GlobalTransform, With<RaiseTrack>>,
+    track: Query<&RelativeCursorPosition, With<RaiseTrack>>,
     mut dragging: Local<bool>,
 ) {
     if !bet.active || bet.max_raise <= bet.min_raise {
         *dragging = false;
+        wheel.clear();
         return;
     }
-    if !mouse.pressed(MouseButton::Left) {
-        *dragging = false;
+    let span = (bet.max_raise - bet.min_raise) as f32;
+    if let Ok(rel) = track.get_single() {
+        if !mouse.pressed(MouseButton::Left) {
+            *dragging = false;
+        }
+        if mouse.just_pressed(MouseButton::Left) && rel.mouse_over() {
+            *dragging = true;
+        }
+        if *dragging {
+            if let Some(n) = rel.normalized {
+                let frac = n.x.clamp(0.0, 1.0);
+                bet.raise_to = bet.min_raise + (frac * span).round() as u32;
+            }
+        }
     }
-    let Ok(window) = windows.get_single() else { return };
-    let Some(cursor) = window.cursor_position() else { return };
-    let Ok(gt) = track.get_single() else { return };
-    let center = gt.translation();
-    let left = center.x - SLIDER_W / 2.0;
-    let top = center.y - 11.0; // 轨道高 22
-    // 命中区：横向略放宽，纵向覆盖滑块（不向下延伸到「加注」按钮，免得点按钮时误改额）。
-    let within = cursor.x >= left - 10.0
-        && cursor.x <= left + SLIDER_W + 10.0
-        && cursor.y >= top - 12.0
-        && cursor.y <= top + 26.0;
-    if mouse.just_pressed(MouseButton::Left) && within {
-        *dragging = true;
+    // 滚轮微调（轮到自己时随时可用）。
+    let mut steps = 0i32;
+    for ev in wheel.read() {
+        steps += ev.y.signum() as i32;
     }
-    if *dragging {
-        let frac = ((cursor.x - left) / SLIDER_W).clamp(0.0, 1.0);
-        let span = (bet.max_raise - bet.min_raise) as f32;
-        bet.raise_to = bet.min_raise + (frac * span).round() as u32;
+    if steps != 0 {
+        let v = bet.raise_to as i32 + steps * RAISE_STEP as i32;
+        bet.raise_to = v.clamp(bet.min_raise as i32, bet.max_raise as i32) as u32;
     }
 }
 
