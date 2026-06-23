@@ -253,7 +253,6 @@ struct PotState {
     target: u32,     // 真实底池
     last_target: u32, // 上次的 target，用来识别「底池涨了」
     flash: f32,      // 涨钱时的高亮脉冲 1..0
-    chip_tier: Option<usize>, // 当前筹码堆已渲染的枚数（变了才重建）
 }
 
 /// 底池面板根 / 金额文字 / 筹码堆容器 / 落入底池的筹码动画。
@@ -329,11 +328,22 @@ const BORROW_BUTTON_X: f32 = 34.0;
 const BORROW_BUTTON_Y: f32 = PLAYER_DOCK_Y - 68.0;
 
 // 底池显示（牌桌中央、地牢池与玩家 dock 之间的空档）。
-const POT_W: f32 = 320.0;
-const POT_H: f32 = 92.0;
-const POT_X: f32 = (W - POT_W) / 2.0;
-const POT_Y: f32 = 752.0;
-const CHIP_D: f32 = 30.0; // 单枚筹码直径
+const POOL_ASPECT: f32 = 1103.0 / 293.0; // bottom_pool 已裁掉透明边，整图即底池本体（宽 / 高）
+const POOL_W: f32 = 510.0;             // 底池盆图宽
+const POOL_H: f32 = POOL_W / POOL_ASPECT; // 盆图高 ≈178
+const POOL_X: f32 = (W - POOL_W) / 2.0; // 盆水平居中
+const POOL_CY: f32 = 808.0;            // 盆垂直中心（牌桌中段，调 POOL_W 时仍居中）
+const POOL_Y: f32 = POOL_CY - POOL_H / 2.0; // 盆顶
+const COIN_D: f32 = 76.0;              // 单枚货币直径
+
+/// 五种面值依次增大的货币素材（高 → 低）：用于按面值堆出底池。
+const COIN_ARTS: [(&str, u32); 5] = [
+    ("Jackpot_coin.png", 500),
+    ("Crown_Coin.png", 100),
+    ("gold_coin.png", 25),
+    ("silver_coin.png", 5),
+    ("copper_coin.png", 1),
+];
 
 /// 牌桌背景现由 game_core 的 [`Scene`] 决定（每手随机 + 挂 buff），见 sync_scene_bg。
 /// 每局随机的卡背。
@@ -896,8 +906,8 @@ fn enter_single_player(
     // 清掉可能残留的点选状态（上次中途离开单人留下的）。
     commands.remove_resource::<Selection>();
     spawn_bet_hud(&mut commands);
-    spawn_pot_display(&mut commands);
-    commands.insert_resource(PotState::default()); // 新局重置底池显示（含筹码堆重建标记）
+    spawn_pot_display(&mut commands, &assets);
+    commands.insert_resource(PotState::default()); // 新局重置底池显示
     commands.insert_resource(RevealCount(0));
     commands.insert_resource(session);
 }
@@ -1699,8 +1709,8 @@ fn enter_mp_game(
     });
 
     spawn_bet_hud(&mut commands);
-    spawn_pot_display(&mut commands);
-    commands.insert_resource(PotState::default()); // 新局重置底池显示（含筹码堆重建标记）
+    spawn_pot_display(&mut commands, &assets);
+    commands.insert_resource(PotState::default()); // 新局重置底池显示
 }
 
 /// 用最新视图刷新所有牌槽 + 借锅按钮显隐 + 背景。
@@ -2561,83 +2571,117 @@ fn animate_cards(
     }
 }
 
-/// 牌桌中央的底池面板：装饰筹码堆 + 实时金额。单机/联机进局时各调一次。
-fn spawn_pot_display(commands: &mut Commands) {
+/// 牌桌中央的底池：底池盆图（水平居中）+ 货币堆 + 盆右侧实时金额。单机/联机进局时各调一次。
+fn spawn_pot_display(commands: &mut Commands, assets: &AssetServer) {
     commands
         .spawn((
             PotDisplayRoot,
             Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(POT_X),
-                top: Val::Px(POT_Y),
-                width: Val::Px(POT_W),
-                height: Val::Px(POT_H),
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::Center,
-                column_gap: Val::Px(16.0),
-                border: UiRect::all(Val::Px(2.0)),
+                left: Val::Px(POOL_X),
+                top: Val::Px(POOL_Y),
+                width: Val::Px(POOL_W),
+                height: Val::Px(POOL_H),
                 ..default()
             },
-            BorderColor(Color::srgba(0.85, 0.72, 0.35, 0.55)),
-            BackgroundColor(Color::srgba(0.05, 0.045, 0.03, 0.72)),
-            BorderRadius::all(Val::Px(16.0)),
+            ImageNode::new(assets.load("bottom_pool.png")),
             GlobalZIndex(40),
         ))
-        .with_children(|p| {
-            // 筹码堆容器（枚数随底池增多，由 pot_display 重建）。
-            p.spawn((
+        .with_children(|b| {
+            // 货币堆容器，铺满整个盆。
+            b.spawn((
                 Node {
-                    width: Val::Px(86.0),
-                    height: Val::Px(70.0),
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    top: Val::Px(0.0),
+                    width: Val::Px(POOL_W),
+                    height: Val::Px(POOL_H),
                     ..default()
                 },
                 PotChipStack,
             ));
-            p.spawn((
-                Text::new("底池 0"),
-                TextFont { font_size: 34.0, ..default() },
-                TextColor(Color::srgb(0.97, 0.86, 0.50)),
+            // 金额数字（盆右侧，垂直居中）。
+            b.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(POOL_W + 24.0),
+                    top: Val::Px(POOL_H / 2.0 - 38.0),
+                    ..default()
+                },
+                Text::new("0"),
+                TextFont { font_size: 64.0, ..default() },
+                TextColor(Color::srgb(0.99, 0.88, 0.52)),
                 PotAmountText,
             ));
         });
 }
 
-/// 底池筹码枚数：每 100 一枚，封顶 18。底池为 0 时不显示。
-fn chip_count(pot: u32) -> usize {
-    if pot == 0 {
-        0
-    } else {
-        ((pot / 100) as usize + 1).min(18)
+/// 把底池金额贪心拆成各面值的枚数（高面值优先，总数封顶），用于直观堆币。
+fn coin_pile(pot: u32) -> [usize; 5] {
+    let mut counts = [0usize; 5];
+    let mut rem = pot;
+    let mut total = 0usize;
+    const MAX_TOTAL: usize = 10;
+    for (i, (_, denom)) in COIN_ARTS.iter().enumerate() {
+        if rem == 0 || total >= MAX_TOTAL {
+            break;
+        }
+        let c = ((rem / denom) as usize).min(MAX_TOTAL - total);
+        counts[i] = c;
+        total += c;
+        rem -= c as u32 * denom;
     }
+    counts
 }
 
-/// 按枚数重建筹码堆：分列（每列 6 枚）向上叠放，像扑克筹码堆。
-fn rebuild_chip_stack(commands: &mut Commands, stack: Entity, n: usize) {
+/// 当前底池最高面值的货币素材（用于撒落动画）。
+fn top_coin_art(pot: u32) -> &'static str {
+    for (art, denom) in COIN_ARTS.iter() {
+        if pot >= *denom {
+            return art;
+        }
+    }
+    COIN_ARTS[COIN_ARTS.len() - 1].0
+}
+
+/// 盆内货币散落区域：(左, 上, 可用宽, 可用高)。整图即底池本体，货币铺满整盆、只留小边。
+fn pool_scatter_region() -> (f32, f32, f32, f32) {
+    let mx = COIN_D * 0.15;
+    let my = COIN_D * 0.10;
+    let w = (POOL_W - COIN_D - mx * 2.0).max(1.0);
+    let h = (POOL_H - COIN_D - my * 2.0).max(1.0);
+    (mx, my, w, h)
+}
+
+/// 按底池金额重建货币堆：高面值在前，随机散落在盆内各处（固定种子，重建时不乱跳）。
+fn rebuild_chip_stack(commands: &mut Commands, assets: &AssetServer, stack: Entity, pot: u32) {
     commands.entity(stack).despawn_descendants();
+    let pile = coin_pile(pot);
+    let mut coins: Vec<&'static str> = Vec::new();
+    for (i, (art, _)) in COIN_ARTS.iter().enumerate() {
+        for _ in 0..pile[i] {
+            coins.push(art);
+        }
+    }
+    if coins.is_empty() {
+        return;
+    }
+    let (rx, ry, rw, rh) = pool_scatter_region();
+    let mut rng = game_core::rng::Rng::new(0xC0FFEE); // 固定种子：散落位置稳定
     commands.entity(stack).with_children(|p| {
-        for i in 0..n {
-            let col = (i / 6) as f32;
-            let row = (i % 6) as f32;
-            let color = match i % 4 {
-                0 => Color::srgb(0.78, 0.22, 0.24),
-                1 => Color::srgb(0.22, 0.40, 0.72),
-                2 => Color::srgb(0.24, 0.58, 0.34),
-                _ => Color::srgb(0.90, 0.74, 0.30),
-            };
+        for art in coins.iter() {
+            let fx = (rng.next_u64() % 1000) as f32 / 1000.0;
+            let fy = (rng.next_u64() % 1000) as f32 / 1000.0;
             p.spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: Val::Px(col * 18.0),
-                    top: Val::Px(40.0 - row * 8.0),
-                    width: Val::Px(CHIP_D),
-                    height: Val::Px(CHIP_D),
-                    border: UiRect::all(Val::Px(3.0)),
+                    left: Val::Px(rx + fx * rw),
+                    top: Val::Px(ry + fy * rh),
+                    width: Val::Px(COIN_D),
+                    height: Val::Px(COIN_D),
                     ..default()
                 },
-                BorderColor(Color::srgba(1.0, 1.0, 1.0, 0.65)),
-                BackgroundColor(color),
-                BorderRadius::all(Val::Px(CHIP_D / 2.0)),
+                ImageNode::new(assets.load(*art)),
             ));
         }
     });
@@ -2663,28 +2707,24 @@ fn update_pot_mp(net: Option<Res<Net>>, mut pot: ResMut<PotState>) {
 fn pot_display(
     mut commands: Commands,
     time: Res<Time>,
+    assets: Res<AssetServer>,
     mut pot: ResMut<PotState>,
     mut text_q: Query<(&mut Text, &mut TextFont), With<PotAmountText>>,
-    mut root_q: Query<&mut BorderColor, With<PotDisplayRoot>>,
     stack_q: Query<Entity, With<PotChipStack>>,
 ) {
     if pot.target != pot.last_target {
         if pot.target > pot.last_target {
             pot.flash = 1.0;
-            spawn_pot_chips(&mut commands);
+            spawn_pot_chips(&mut commands, &assets, pot.target);
         } else {
             // 新一手底池清零：直接归位，别从大数往下滚。
             pot.shown = pot.target as f32;
         }
-        pot.last_target = pot.target;
-    }
-    // 筹码堆枚数随底池变化时重建。
-    let tier = chip_count(pot.target);
-    if pot.chip_tier != Some(tier) {
-        pot.chip_tier = Some(tier);
+        // 货币堆按新底池金额重建。
         if let Ok(stack) = stack_q.get_single() {
-            rebuild_chip_stack(&mut commands, stack, tier);
+            rebuild_chip_stack(&mut commands, &assets, stack, pot.target);
         }
+        pot.last_target = pot.target;
     }
     let dt = time.delta_secs();
     pot.shown += (pot.target as f32 - pot.shown) * (1.0 - (-dt * 9.0).exp());
@@ -2694,67 +2734,51 @@ fn pot_display(
     pot.flash = (pot.flash - dt * 1.8).max(0.0);
     let flash = pot.flash;
     for (mut t, mut font) in &mut text_q {
-        t.0 = format!("底池 {}", pot.shown.round() as u32);
-        font.font_size = 34.0 + 12.0 * flash;
-    }
-    for mut bc in &mut root_q {
-        bc.0 = Color::srgba(
-            (0.85 + 0.15 * flash).min(1.0),
-            (0.72 + 0.22 * flash).min(1.0),
-            0.35 + 0.40 * flash,
-            (0.55 + 0.45 * flash).min(1.0),
-        );
+        t.0 = format!("{}", pot.shown.round() as u32);
+        font.font_size = 64.0 + 18.0 * flash;
     }
 }
 
-/// 撒一把筹码从上方落入底池（涨钱时调用）。
-fn spawn_pot_chips(commands: &mut Commands) {
-    let cx = POT_X + POT_W / 2.0;
+/// 撒一把货币从上方落入底池盆的随机位置（涨钱时调用），用当前最高面值的素材。
+fn spawn_pot_chips(commands: &mut Commands, assets: &AssetServer, pot: u32) {
+    let art = top_coin_art(pot);
+    let (rx, ry, rw, rh) = pool_scatter_region();
     let mut rng = game_core::rng::Rng::new(random_seed());
     for _ in 0..5 {
-        let off = (rng.next_u64() % 140) as f32 - 70.0;
-        let col = match rng.next_u64() % 4 {
-            0 => Color::srgb(0.78, 0.22, 0.24),
-            1 => Color::srgb(0.22, 0.40, 0.72),
-            2 => Color::srgb(0.24, 0.58, 0.34),
-            _ => Color::srgb(0.90, 0.74, 0.30),
-        };
-        let left = cx + off - CHIP_D / 2.0;
-        let from_top = POT_Y - 130.0 - (rng.next_u64() % 50) as f32;
-        let to_top = POT_Y + 4.0 + (rng.next_u64() % 34) as f32;
+        let fx = (rng.next_u64() % 1000) as f32 / 1000.0;
+        let fy = (rng.next_u64() % 1000) as f32 / 1000.0;
+        let left = POOL_X + rx + fx * rw;
+        let to_top = POOL_Y + ry + fy * rh;
+        let from_top = POOL_Y - 160.0 - (rng.next_u64() % 60) as f32;
         commands.spawn((
             PotChip { timer: Timer::from_seconds(0.55, TimerMode::Once), from_top, to_top },
             Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(left),
                 top: Val::Px(from_top),
-                width: Val::Px(CHIP_D),
-                height: Val::Px(CHIP_D),
-                border: UiRect::all(Val::Px(3.0)),
+                width: Val::Px(COIN_D),
+                height: Val::Px(COIN_D),
                 ..default()
             },
-            BorderColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
-            BackgroundColor(col),
-            BorderRadius::all(Val::Px(CHIP_D / 2.0)),
+            ImageNode::new(assets.load(art)),
             GlobalZIndex(60),
         ));
     }
 }
 
-/// 筹码下落动画：加速落入底池，尾段淡出后销毁。
+/// 货币下落动画：加速落入底池盆，尾段淡出后销毁。
 fn chip_drops(
     mut commands: Commands,
     time: Res<Time>,
-    mut q: Query<(Entity, &mut PotChip, &mut Node, &mut BackgroundColor, &mut BorderColor)>,
+    mut q: Query<(Entity, &mut PotChip, &mut Node, &mut ImageNode)>,
 ) {
-    for (e, mut chip, mut node, mut bg, mut border) in &mut q {
+    for (e, mut chip, mut node, mut img) in &mut q {
         chip.timer.tick(time.delta());
         let f = chip.timer.fraction();
         let ease = 1.0 - (1.0 - f) * (1.0 - f); // ease-out（落下加速感）
         node.top = Val::Px(chip.from_top + (chip.to_top - chip.from_top) * ease);
         let a = if f > 0.7 { (1.0 - (f - 0.7) / 0.3).max(0.0) } else { 1.0 };
-        bg.0.set_alpha(a);
-        border.0.set_alpha(a * 0.7);
+        img.color = Color::srgba(1.0, 1.0, 1.0, a);
         if chip.timer.finished() {
             commands.entity(e).despawn_recursive();
         }
